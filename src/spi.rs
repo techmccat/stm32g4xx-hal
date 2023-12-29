@@ -204,6 +204,7 @@ macro_rules! spi {
         }
 
         impl<PINS> Spi<$SPIX, PINS> {
+            #[inline]
             fn nb_read<W: FrameSize>(&mut self) -> nb::Result<W, Error> {
                 let sr = self.spi.sr.read();
                 Err(if sr.ovr().bit_is_set() {
@@ -222,6 +223,7 @@ macro_rules! spi {
                     nb::Error::WouldBlock
                 })
             }
+            #[inline]
             fn nb_write<W: FrameSize>(&mut self, word: W) -> nb::Result<(), Error> {
                 let sr = self.spi.sr.read();
                 Err(if sr.ovr().bit_is_set() {
@@ -239,12 +241,14 @@ macro_rules! spi {
                     nb::Error::WouldBlock
                 })
             }
-            fn set_tx_only(&mut self) {
+            #[inline]
+            pub fn set_tx_only(&mut self) {
                 self.spi
                     .cr1
                     .modify(|_, w| w.bidimode().set_bit().bidioe().set_bit());
             }
-            fn set_bidi(&mut self) {
+            #[inline]
+            pub fn set_bidi(&mut self) {
                 self.spi
                     .cr1
                     .modify(|_, w| w.bidimode().clear_bit().bidioe().clear_bit());
@@ -285,10 +289,14 @@ macro_rules! spi {
             }
 
             fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+                let catch = |spi: &mut Self| Ok(for w in words {
+                        nb::block!(spi.nb_write(*w))?
+                    });
+
                 self.set_tx_only();
-                Ok(for w in words {
-                    nb::block!(self.nb_write(*w))?
-                })
+                let res = catch(self);
+                self.set_bidi();
+                res
             }
 
             fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
@@ -333,16 +341,23 @@ macro_rules! spi {
                 Ok(())
             }
             fn flush(&mut self) -> Result<(), Self::Error> {
+                let catch = |spi: &mut Self| {
+                    // drain rx fifo
+                    while match spi.nb_read::<u8>() {
+                        Ok(_) => true,
+                        Err(nb::Error::WouldBlock) => false,
+                        Err(nb::Error::Other(e)) => { return Err(e) }
+                    } { core::hint::spin_loop() };
+                    // wait for tx fifo to be drained by the peripheral
+                    while spi.spi.sr.read().ftlvl() != 0 { core::hint::spin_loop() };
+                    Ok(())
+                };
+
                 // stop receiving data
                 self.set_tx_only();
-                // wait for tx fifo to be drained by the peripheral
-                while self.spi.sr.read().ftlvl() != 0 { core::hint::spin_loop() };
-                // drain rx fifo
-                Ok(while match self.nb_read::<u8>() {
-                    Ok(_) => true,
-                    Err(nb::Error::WouldBlock) => false,
-                    Err(nb::Error::Other(e)) => return Err(e)
-                } { core::hint::spin_loop() })
+                let res = catch(self);
+                self.set_bidi();
+                res
             }
         }
 
