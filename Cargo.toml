@@ -96,12 +96,12 @@ defmt-logging = ["defmt", "nb/defmt-0-3"]
 
 [profile.dev]
 codegen-units = 1
-debug = true
+debug = 2
 incremental = false
 lto = false
 
 [profile.release]
-debug = true
+debug = 2
 codegen-units = 1
 incremental = false
 lto = true

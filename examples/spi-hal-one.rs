@@ -6,13 +6,7 @@
 #![no_std]
 
 use crate::hal::{
-    block,
     delay::DelayFromCountDownTimer,
-    gpio::gpioa::PA5,
-    gpio::gpioa::PA6,
-    gpio::gpioa::PA7,
-    gpio::Alternate,
-    gpio::AF5,
     prelude::*,
     pwr::PwrExt,
     rcc::Config,
@@ -23,15 +17,17 @@ use crate::hal::{
 };
 
 use cortex_m_rt::entry;
-use utils::logger::info;
+use embedded_hal_one::spi::SpiBus;
 use stm32g4xx_hal as hal;
 
 #[macro_use]
 mod utils;
+use utils::logger::info;
 
 #[entry]
 fn main() -> ! {
     utils::logger::init();
+    info!("Logger init");
 
     let dp = Peripherals::take().unwrap();
     let rcc = dp.RCC.constrain();
@@ -40,10 +36,11 @@ fn main() -> ! {
     let timer2 = Timer::new(dp.TIM2, &rcc.clocks);
     let mut delay_tim2 = DelayFromCountDownTimer::new(timer2.start_count_down(100.millis()));
 
+    // let gpioa = dp.GPIOA.split(&mut rcc);
     let gpioa = dp.GPIOA.split(&mut rcc);
-    let sclk: PA5<Alternate<AF5>> = gpioa.pa5.into_alternate();
-    let miso: PA6<Alternate<AF5>> = gpioa.pa6.into_alternate();
-    let mosi: PA7<Alternate<AF5>> = gpioa.pa7.into_alternate();
+    let sclk = gpioa.pa5.into_alternate();
+    let miso = gpioa.pa6.into_alternate();
+    let mosi = gpioa.pa7.into_alternate();
 
     let mut spi = dp
         .SPI1
@@ -52,18 +49,23 @@ fn main() -> ! {
     cs.set_high().unwrap();
 
     // "Hello world!"
-    let message: [char; 12] = ['H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd', '!'];
-    let mut received_byte: u8;
+    const MESSAGE: &[u8] = "Hello world!".as_bytes();
+    let received = &mut [0u8; MESSAGE.len()];
 
+    cs.set_low().unwrap();
+    SpiBus::transfer(&mut spi, received, MESSAGE).unwrap();
+    spi.flush().unwrap();
+    cs.set_high().unwrap();
+
+    info!("Received {:?}", core::str::from_utf8(received).ok());
+    delay_tim2.delay_ms(10_u16);
+
+    cs.set_low().unwrap();
+    embedded_hal::blocking::spi::Write::write(&mut spi, received).unwrap();
+    cs.set_high().unwrap();
+
+    // info!("{:?}", core::str::from_utf8(received).ok());
     loop {
-        for byte in message.iter() {
-            cs.set_low().unwrap();
-            spi.send(*byte as u8).unwrap();
-            received_byte = block!(spi.read()).unwrap();
-            cs.set_high().unwrap();
-
-            info!("{}", received_byte as char);
-        }
-        delay_tim2.delay_ms(1000_u16);
+        cortex_m::asm::nop();
     }
 }
