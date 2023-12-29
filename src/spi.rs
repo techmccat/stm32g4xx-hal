@@ -267,6 +267,14 @@ macro_rules! spi {
                     .cr1
                     .modify(|_, w| w.bidimode().clear_bit().bidioe().clear_bit());
             }
+            fn fifo_cap(&self) -> u8 {
+                match self.spi.sr.read().ftlvl().bits() {
+                    0 => 4,
+                    1 => 3,
+                    2 => 2,
+                    _ => 0,
+                }
+            }
         }
 
         impl SpiExt<$SPIX> for $SPIX {
@@ -286,21 +294,23 @@ macro_rules! spi {
         impl<PINS> embedded_hal_one::spi::SpiBus for Spi<$SPIX, PINS> {
             fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
                 if words.len() == 0 { return Ok(()) }
-                // clear tx-only status in the case the previous operation was a write
-                self.set_bidi();
+
                 // prefill write fifo so that the clock doen't stop while fetch the read byte
-                // one frame should be enough?
-                nb::block!(self.nb_write(0u8))?;
+                let prefill = self.fifo_cap() as usize;
+                for _ in 0..prefill {
+                    nb::block!(self.nb_write(0u8))?;
+                }
+
                 let len = words.len();
-                for r in words[..len-1].iter_mut() {
+                for r in words[..len-prefill].iter_mut() {
                     // TODO: 16 bit frames, bidirectional pins
                     nb::block!(self.nb_write(0u8))?;
                     // errors have been checked by the write above
                     *r = unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() };
                 }
-                // safety: length > 0 checked at start of function
-                *words.last_mut().unwrap() = nb::block!(self.nb_read())?;
-                Ok(())
+                Ok(for r in words[len-prefill..].iter_mut() {
+                    *r = nb::block!(self.nb_read())?;
+                })
             }
 
             fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
@@ -321,17 +331,28 @@ macro_rules! spi {
                     return self.read(read)
                 }
 
-                self.set_bidi();
+                let prefill = self.fifo_cap();
+                let mut write_iter = write.into_iter();
+
                 // same prefill as in read, this time with actual data
-                nb::block!(self.nb_write(write[0]))?;
+                let mut prefilled = 0;
+                for b in write_iter.by_ref().take(prefill as usize) {
+                    nb::block!(self.nb_write(*b))?;
+                    prefilled += 1
+                }
+
                 let common_len = core::cmp::min(read.len(), write.len());
-                // take 1 less because write skips the first element
-                let zipped = read.iter_mut().zip(write.into_iter().skip(1)).take(common_len - 1);
+                // write ahead of reading
+                let zipped = read.iter_mut().zip(write_iter).take(common_len - prefilled);
                 for (r, w) in zipped {
                     nb::block!(self.nb_write(*w))?;
                     *r = unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() };
                 }
-                read[common_len-1] = nb::block!(self.nb_read())?;
+
+                // read words left in the fifo
+                for r in read[common_len-prefilled..common_len].iter_mut() {
+                    *r = nb::block!(self.nb_read())?
+                }
                 
                 if read.len() > common_len {
                     self.read(&mut read[common_len..])
@@ -341,19 +362,25 @@ macro_rules! spi {
             }
             fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
                 if words.len() == 0 { return Ok(()) }
-                self.set_bidi();
-                nb::block!(self.nb_write(words[0]))?;
-                let cells = core::cell::Cell::from_mut(words).as_slice_of_cells();
 
-                for rw in cells.windows(2) {
-                    let r = &rw[0];
-                    let w = &rw[1];
-                    
+                let cells = core::cell::Cell::from_mut(words).as_slice_of_cells();
+                let mut write_iter = cells.into_iter();
+                let mut read_iter = cells.into_iter();
+
+                let prefill = self.fifo_cap();
+
+                for w in write_iter.by_ref().take(prefill as usize) {
+                    nb::block!(self.nb_write(w.get()))?;
+                }
+
+                for (r, w) in write_iter.zip(read_iter.by_ref()) {
                     nb::block!(self.nb_write(w.get()))?;
                     r.set(unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() });
                 }
-                *words.last_mut().unwrap() = nb::block!(self.nb_read())?;
-                Ok(())
+
+                Ok(for r in read_iter {
+                    r.set(nb::block!(self.nb_read())?);
+                })
             }
             fn flush(&mut self) -> Result<(), Self::Error> {
                 let catch = |spi: &mut Self| {

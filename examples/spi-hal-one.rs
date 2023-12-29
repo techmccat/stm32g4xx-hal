@@ -43,8 +43,9 @@ fn main() -> ! {
     let miso = gpioa.pa6.into_alternate();
     let mosi = gpioa.pa7.into_alternate();
 
-    // 1/8 SPI/SysClk ratio seems to be the upper limit for continuous transmission one bit at a
-    // time
+    // 1/8 SPI/SysClk ratio seems to be the upper limit for continuous transmission
+    // one byte at a time
+    // 1/4 works for the first ~5 bytes (+4 prefilled), then we hit cpu limits
     let mut spi = dp
         .SPI1
         .spi((sclk, miso, mosi), spi::MODE_0, 2.MHz(), &mut rcc);
@@ -52,7 +53,7 @@ fn main() -> ! {
     cs.set_high().unwrap();
 
     // "Hello world!"
-    const MESSAGE: &[u8] = "Hello world!".as_bytes();
+    const MESSAGE: &[u8] = "Hello world, but longer!".as_bytes();
     let received = &mut [0u8; MESSAGE.len()];
 
     cs.set_low().unwrap();
@@ -64,6 +65,7 @@ fn main() -> ! {
     embedded_hal::blocking::spi::Write::write(&mut spi, MESSAGE).unwrap();
     cs.set_high().unwrap();
     info!("Received {:?}", core::str::from_utf8(received).ok());
+    assert_eq!(MESSAGE, received);
 
     loop {
         cortex_m::asm::nop();
