@@ -214,11 +214,7 @@ macro_rules! spi {
                 } else if sr.crcerr().bit_is_set() {
                     nb::Error::Other(Error::Crc)
                 } else if sr.rxne().bit_is_set() {
-                    // NOTE(read_volatile) read only 1 byte (the svd2rust API only allows
-                    // reading a half-word)
-                    return Ok(unsafe {
-                        ptr::read_volatile(&self.spi.dr as *const _ as *const W)
-                    });
+                    return Ok(self.read_unchecked());
                 } else {
                     nb::Error::WouldBlock
                 })
@@ -233,13 +229,31 @@ macro_rules! spi {
                 } else if sr.crcerr().bit_is_set() {
                     nb::Error::Other(Error::Crc)
                 } else if sr.txe().bit_is_set() {
-                    let dr = &self.spi.dr as *const _ as *const UnsafeCell<W>;
-                    // NOTE(write_volatile) see note above
-                    unsafe { ptr::write_volatile(UnsafeCell::raw_get(dr), word) };
+                    self.write_unchecked(word);
                     return Ok(());
                 } else {
                     nb::Error::WouldBlock
                 })
+            }
+            #[inline]
+            fn nb_read_no_err(&mut self) -> nb::Result<u8, ()> {
+                if self.spi.sr.read().rxne().bit_is_set() {
+                    Ok(self.read_unchecked())
+                } else {
+                    Err(nb::Error::WouldBlock)
+                }
+            }
+            #[inline]
+            fn read_unchecked<W: FrameSize>(&mut self) -> W {
+                // NOTE(read_volatile) read only 1 byte (the svd2rust API only allows
+                // reading a half-word)
+                unsafe { ptr::read_volatile(&self.spi.dr as *const _ as *const W) }
+            }
+            #[inline]
+            fn write_unchecked<W: FrameSize>(&mut self, word: W) {
+                let dr = &self.spi.dr as *const _ as *const UnsafeCell<W>;
+                // NOTE(write_volatile) see note above
+                unsafe { ptr::write_volatile(UnsafeCell::raw_get(dr), word) };
             }
             #[inline]
             pub fn set_tx_only(&mut self) {
@@ -278,10 +292,11 @@ macro_rules! spi {
                 // one frame should be enough?
                 nb::block!(self.nb_write(0u8))?;
                 let len = words.len();
-                for w in words[..len-1].iter_mut() {
+                for r in words[..len-1].iter_mut() {
                     // TODO: 16 bit frames, bidirectional pins
                     nb::block!(self.nb_write(0u8))?;
-                    *w = nb::block!(self.nb_read())?;
+                    // errors have been checked by the write above
+                    *r = unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() };
                 }
                 // safety: length > 0 checked at start of function
                 *words.last_mut().unwrap() = nb::block!(self.nb_read())?;
@@ -314,7 +329,7 @@ macro_rules! spi {
                 let zipped = read.iter_mut().zip(write.into_iter().skip(1)).take(common_len - 1);
                 for (r, w) in zipped {
                     nb::block!(self.nb_write(*w))?;
-                    *r = nb::block!(self.nb_read())?;
+                    *r = unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() };
                 }
                 read[common_len-1] = nb::block!(self.nb_read())?;
                 
@@ -335,7 +350,7 @@ macro_rules! spi {
                     let w = &rw[1];
                     
                     nb::block!(self.nb_write(w.get()))?;
-                    r.set(nb::block!(self.nb_read())?);
+                    r.set(unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() });
                 }
                 *words.last_mut().unwrap() = nb::block!(self.nb_read())?;
                 Ok(())
