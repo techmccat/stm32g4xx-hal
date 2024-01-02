@@ -236,7 +236,7 @@ macro_rules! spi {
                 })
             }
             #[inline]
-            fn nb_read_no_err(&mut self) -> nb::Result<u8, ()> {
+            fn nb_read_no_err<W: FrameSize>(&mut self) -> nb::Result<W, ()> {
                 if self.spi.sr.read().rxne().bit_is_set() {
                     Ok(self.read_unchecked())
                 } else {
@@ -295,20 +295,35 @@ macro_rules! spi {
             fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
                 if words.len() == 0 { return Ok(()) }
 
+                // FIFO threshold to 16 bits
+                self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
+
                 // prefill write fifo so that the clock doen't stop while fetch the read byte
-                let prefill = self.fifo_cap() as usize;
+                let prefill = self.fifo_cap() as usize / 2;
                 for _ in 0..prefill {
-                    nb::block!(self.nb_write(0u8))?;
+                    nb::block!(self.nb_write(0u16))?;
                 }
 
                 let len = words.len();
-                for r in words[..len-prefill].iter_mut() {
-                    // TODO: 16 bit frames, bidirectional pins
-                    nb::block!(self.nb_write(0u8))?;
-                    // errors have been checked by the write above
-                    *r = unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() };
+                let half_len = len / 2;
+                let pair_left = len % 2;
+
+                for r in words.chunks_exact_mut(2).take(half_len-prefill) {
+                    nb::block!(self.nb_write(0u16))?;
+                    let r_two: u16 = unsafe {
+                        nb::block!(self.nb_read_no_err()).unwrap_unchecked()
+                    };
+                    // safety: chunks have exact length of 2
+                    unsafe { *r.as_mut_ptr().cast() = r_two.to_le_bytes(); }
                 }
-                Ok(for r in words[len-prefill..].iter_mut() {
+
+                // FIFO threshold to 8 bits
+                self.spi.cr2.modify(|_, w| w.frxth().set_bit());
+                if pair_left == 1 {
+                    nb::block!(self.nb_write(0u8))?;
+                }
+
+                Ok(for r in words[len - prefill - pair_left..].iter_mut() {
                     *r = nb::block!(self.nb_read())?;
                 })
             }
@@ -331,26 +346,50 @@ macro_rules! spi {
                     return self.read(read)
                 }
 
-                let prefill = self.fifo_cap();
-                let mut write_iter = write.into_iter();
+                let common_len = core::cmp::min(read.len(), write.len());
+                let half_len = common_len / 2;
+                let pair_left = common_len % 2;
+
+                // write two bytes at once
+                let prefill = self.fifo_cap() / 2;
+                let mut write_iter = write.chunks_exact(2).map(|two|
+                    // safety: chunks_exact guarantees that chunks have 2 elements
+                    // second byte in send queue goes to the top of the 16-bit data register for
+                    // packing
+                    u16::from_le_bytes(unsafe { *two.as_ptr().cast() })
+                );
 
                 // same prefill as in read, this time with actual data
                 let mut prefilled = 0;
                 for b in write_iter.by_ref().take(prefill as usize) {
-                    nb::block!(self.nb_write(*b))?;
-                    prefilled += 1
+                    nb::block!(self.nb_write(b))?;
+                    prefilled += 2
                 }
 
-                let common_len = core::cmp::min(read.len(), write.len());
+                // FIFO threshold to 16 bits
+                self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
                 // write ahead of reading
-                let zipped = read.iter_mut().zip(write_iter).take(common_len - prefilled);
+                let zipped = read.chunks_exact_mut(2).zip(write_iter).take(half_len - prefilled/2);
                 for (r, w) in zipped {
-                    nb::block!(self.nb_write(*w))?;
-                    *r = unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() };
+
+                    nb::block!(self.nb_write(w))?;
+                    let r_two: u16 = unsafe {
+                        nb::block!(self.nb_read_no_err()).unwrap_unchecked()
+                    };
+                    // same as above, length is checked by chunks_exact
+                    unsafe { *r.as_mut_ptr().cast() = r_two.to_le_bytes(); }
+                }
+
+                // FIFO threshold to 8 bits
+                self.spi.cr2.modify(|_, w| w.frxth().set_bit());
+
+                if pair_left == 1 {
+                    let write_idx = common_len - 1;
+                    nb::block!(self.nb_write(write[write_idx]))?;
                 }
 
                 // read words left in the fifo
-                for r in read[common_len-prefilled..common_len].iter_mut() {
+                for r in read[common_len-prefilled-pair_left..common_len].iter_mut() {
                     *r = nb::block!(self.nb_read())?
                 }
                 
@@ -373,13 +412,17 @@ macro_rules! spi {
                     nb::block!(self.nb_write(w.get()))?;
                 }
 
-                for (r, w) in write_iter.zip(read_iter.by_ref()) {
+                // write iter always finishes first
+                // we don't want to consume an element from read_iter for nothing
+                for (w, r) in write_iter.zip(read_iter.by_ref()) {
                     nb::block!(self.nb_write(w.get()))?;
                     r.set(unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() });
                 }
+                
 
                 Ok(for r in read_iter {
-                    r.set(nb::block!(self.nb_read())?);
+                    let read = nb::block!(self.nb_read())?;
+                    r.set(read);
                 })
             }
             fn flush(&mut self) -> Result<(), Self::Error> {

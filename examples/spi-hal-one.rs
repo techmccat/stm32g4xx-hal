@@ -48,24 +48,33 @@ fn main() -> ! {
     // 1/4 works for the first ~5 bytes (+4 prefilled), then we hit cpu limits
     let mut spi = dp
         .SPI1
-        .spi((sclk, miso, mosi), spi::MODE_0, 2.MHz(), &mut rcc);
+        .spi((sclk, miso, mosi), spi::MODE_0, 4.MHz(), &mut rcc);
     let mut cs = gpioa.pa8.into_push_pull_output();
     cs.set_high().unwrap();
 
-    // "Hello world!"
-    const MESSAGE: &[u8] = "Hello world, but longer!".as_bytes();
+    // Odd number of bits to test packing edge case
+    const MESSAGE: &[u8] = "Hello world, but longer".as_bytes();
     let received = &mut [0u8; MESSAGE.len()];
 
     cs.set_low().unwrap();
     SpiBus::transfer(&mut spi, received, MESSAGE).unwrap();
     spi.flush().unwrap();
     cs.set_high().unwrap();
+    
+    info!("Received {:?}", core::str::from_utf8(received).ok());
+    assert_eq!(MESSAGE, received);
+
+    cs.set_low().unwrap();
+    spi.transfer_in_place(received).unwrap();
+    spi.flush().unwrap();
+    cs.set_high().unwrap();
+
+    info!("Received {:?}", core::str::from_utf8(received).ok());
+    assert_eq!(MESSAGE, received);
 
     cs.set_low().unwrap();
     embedded_hal::blocking::spi::Write::write(&mut spi, MESSAGE).unwrap();
     cs.set_high().unwrap();
-    info!("Received {:?}", core::str::from_utf8(received).ok());
-    assert_eq!(MESSAGE, received);
 
     loop {
         cortex_m::asm::nop();
