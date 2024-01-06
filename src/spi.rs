@@ -400,29 +400,43 @@ macro_rules! spi {
                 }
             }
             fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-                if words.len() == 0 { return Ok(()) }
+                let len = words.len();
+                if len == 0 { return Ok(()) }
 
-                let cells = core::cell::Cell::from_mut(words).as_slice_of_cells();
-                let mut write_iter = cells.into_iter();
-                let mut read_iter = cells.into_iter();
+                self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
+                let half_len = len / 2;
+                let pair_left = len % 2;
 
-                let prefill = self.fifo_cap();
+                let prefill = self.fifo_cap() / 2;
+                let words_alias: &mut [[u8; 2]] = unsafe {
+                    let ptr = words.as_mut_ptr();
+                    core::slice::from_raw_parts_mut(ptr as *mut [u8; 2], half_len)
+                };
 
-                for w in write_iter.by_ref().take(prefill as usize) {
-                    nb::block!(self.nb_write(w.get()))?;
+                let mut prefilled = 0;
+                for b in words_alias.into_iter().take(prefill as usize) {
+                    nb::block!(self.nb_write(u16::from_le_bytes(*b)))?;
+                    prefilled += 2
                 }
 
-                // write iter always finishes first
-                // we don't want to consume an element from read_iter for nothing
-                for (w, r) in write_iter.zip(read_iter.by_ref()) {
-                    nb::block!(self.nb_write(w.get()))?;
-                    r.set(unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() });
+                for i in 0..words_alias.len() - prefilled/2 {
+                    let read: u16 = unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() };
+                    words_alias[i] = read.to_le_bytes();
+                    let write = u16::from_le_bytes(words_alias[i + prefilled/2]);
+                    nb::block!(self.nb_write(write))?;
                 }
+                self.spi.cr2.modify(|_, w| w.frxth().set_bit());
                 
+                if pair_left == 1 {
+                    nb::block!(self.nb_write(*words.last().unwrap()))?;
+                    // reading in the last loop lets the rx buffer overrun for some reason i
+                    // haven't figured out, so we read here
+                    words[len-prefilled-1] = nb::block!(self.nb_read_no_err()).unwrap();
+                }
 
-                Ok(for r in read_iter {
-                    let read = nb::block!(self.nb_read())?;
-                    r.set(read);
+                // read words left in the fifo
+                Ok(for r in words.iter_mut().skip(len-prefilled) {
+                    *r = nb::block!(self.nb_read())?;
                 })
             }
             fn flush(&mut self) -> Result<(), Self::Error> {

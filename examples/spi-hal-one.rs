@@ -45,10 +45,11 @@ fn main() -> ! {
 
     // 1/8 SPI/SysClk ratio seems to be the upper limit for continuous transmission
     // one byte at a time
-    // 1/4 works for the first ~5 bytes (+4 prefilled), then we hit cpu limits
+    // 1/4 works well when writing two packed bytes at once
+    // At 1/2 the clock stays on for ~80% of the time
     let mut spi = dp
         .SPI1
-        .spi((sclk, miso, mosi), spi::MODE_0, 4.MHz(), &mut rcc);
+        .spi((sclk, miso, mosi), spi::MODE_0, 8.MHz(), &mut rcc);
     let mut cs = gpioa.pa8.into_push_pull_output();
     cs.set_high().unwrap();
 
