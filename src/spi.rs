@@ -296,8 +296,11 @@ macro_rules! spi {
                 let len = words.len();
                 if len == 0 { return Ok(()) }
 
+                // flush data from previous operations, otherwise we'd get unwanted data
+                self.flush()?;
                 // FIFO threshold to 16 bits
                 self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
+                self.set_bidi();
 
                 let half_len = len / 2;
                 let pair_left = len % 2;
@@ -309,15 +312,15 @@ macro_rules! spi {
                 }
 
                 for r in words.chunks_exact_mut(2).take(half_len - prefill) {
-                    nb::block!(self.nb_write(0u16))?;
                     let r_two: u16 = unsafe {
                         nb::block!(self.nb_read_no_err()).unwrap_unchecked()
                     };
+                    nb::block!(self.nb_write(0u16))?;
                     // safety: chunks have exact length of 2
                     unsafe { *r.as_mut_ptr().cast() = r_two.to_le_bytes(); }
                 }
 
-                let odd_idx = len.saturating_sub(prefill + pair_left);
+                let odd_idx = len.saturating_sub(2*prefill + pair_left);
                 // FIFO threshold to 8 bits
                 self.spi.cr2.modify(|_, w| w.frxth().set_bit());
                 if pair_left == 1 {
@@ -325,20 +328,16 @@ macro_rules! spi {
                     words[odd_idx] = nb::block!(self.nb_read_no_err()).unwrap();
                 }
 
-                Ok(for r in words[odd_idx+1..].iter_mut() {
+                Ok(for r in words[odd_idx+pair_left..].iter_mut() {
                     *r = nb::block!(self.nb_read())?;
                 })
             }
 
             fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-                let catch = |spi: &mut Self| Ok(for w in words {
-                        nb::block!(spi.nb_write(*w))?
-                    });
-
                 self.set_tx_only();
-                let res = catch(self);
-                self.set_bidi();
-                res
+                Ok(for w in words {
+                    nb::block!(self.nb_write(*w))?
+                })
             }
 
             fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
@@ -348,6 +347,7 @@ macro_rules! spi {
                     return self.read(read)
                 }
 
+                self.set_bidi();
                 let common_len = core::cmp::min(read.len(), write.len());
                 let half_len = common_len / 2;
                 let pair_left = common_len % 2;
@@ -372,7 +372,6 @@ macro_rules! spi {
                 // write ahead of reading
                 let zipped = read.chunks_exact_mut(2).zip(write_iter).take(half_len - prefill);
                 for (r, w) in zipped {
-
                     let r_two: u16 = unsafe {
                         nb::block!(self.nb_read_no_err()).unwrap_unchecked()
                     };
@@ -410,6 +409,7 @@ macro_rules! spi {
                 let len = words.len();
                 if len == 0 { return Ok(()) }
 
+                self.set_bidi();
                 self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
                 let half_len = len / 2;
                 let pair_left = len % 2;
@@ -450,23 +450,16 @@ macro_rules! spi {
                 })
             }
             fn flush(&mut self) -> Result<(), Self::Error> {
-                let catch = |spi: &mut Self| {
-                    // drain rx fifo
-                    while match spi.nb_read::<u8>() {
-                        Ok(_) => true,
-                        Err(nb::Error::WouldBlock) => false,
-                        Err(nb::Error::Other(e)) => { return Err(e) }
-                    } { core::hint::spin_loop() };
-                    // wait for tx fifo to be drained by the peripheral
-                    while spi.spi.sr.read().ftlvl() != 0 { core::hint::spin_loop() };
-                    Ok(())
-                };
-
                 // stop receiving data
                 self.set_tx_only();
-                let res = catch(self);
-                self.set_bidi();
-                res
+                // drain rx fifo
+                while match self.nb_read::<u8>() {
+                    Ok(_) => true,
+                    Err(nb::Error::WouldBlock) => false,
+                    Err(nb::Error::Other(e)) => { return Err(e) }
+                } { core::hint::spin_loop() };
+                // wait for idle
+                Ok(while self.spi.sr.read().bsy().bit() { core::hint::spin_loop() })
             }
         }
 
