@@ -3,6 +3,7 @@
 #![no_main]
 #![no_std]
 
+use embedded_graphics::mono_font::MonoTextStyle;
 use hal::i2c::Config;
 use hal::prelude::*;
 use hal::stm32;
@@ -11,9 +12,16 @@ use stm32g4xx_hal as hal;
 
 use cortex_m_rt::entry;
 
+use sh1106::{prelude::*, Builder};
+use embedded_graphics::{
+    mono_font::ascii::FONT_6X10,
+    pixelcolor::BinaryColor,
+    prelude::*,
+    text::Text,
+};
+
 #[macro_use]
 mod utils;
-use utils::logger::info;
 
 #[entry]
 fn main() -> ! {
@@ -26,18 +34,23 @@ fn main() -> ! {
     let sda = gpiob.pb9.into_alternate_open_drain();
     let scl = gpiob.pb8.into_alternate_open_drain();
 
-    let mut i2c = dp.I2C1.i2c(sda, scl, Config::new(40.kHz()), &mut rcc);
+    let i2c = dp.I2C1.i2c(sda, scl, Config::new(100.kHz()), &mut rcc);
     // Alternatively, it is possible to specify the exact timing as follows (see the documentation
     // of with_timing() for an explanation of the constant):
     //let mut i2c = dp
     //  .I2C1
     //   .i2c(sda, scl, Config::with_timing(0x3042_0f13), &mut rcc);
 
-    let buf: [u8; 1] = [0];
-    loop {
-        match i2c.write(0x3c, &buf) {
-            Ok(_) => info!("ok"),
-            Err(err) => info!("error: {:?}", err),
-        }
-    }
+    let mut disp: GraphicsMode<_> = Builder::new().connect_i2c(i2c).into();
+    disp.init().unwrap();
+    disp.flush().unwrap();
+
+    let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    Text::new("Hello Rust!", Point::new(16, 16), style)
+        .draw(&mut disp)
+        .unwrap();
+
+    disp.flush().unwrap();
+
+    loop {}
 }
