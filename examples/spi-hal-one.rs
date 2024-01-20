@@ -59,7 +59,9 @@ fn main() -> ! {
 
     cs.set_low().unwrap();
     SpiBus::transfer(&mut spi, received, MESSAGE).unwrap();
-    spi.flush().unwrap();
+    // downside of having 8 and 16 bit impls on the same struct is you have to specify which flush
+    // impl to call, although internally they call the same function
+    SpiBus::<u8>::flush(&mut spi).unwrap();
     cs.set_high().unwrap();
     
     info!("Received {:?}", core::str::from_utf8(received).ok());
@@ -67,15 +69,29 @@ fn main() -> ! {
 
     cs.set_low().unwrap();
     spi.transfer_in_place(received).unwrap();
-    spi.flush().unwrap();
+    SpiBus::<u8>::flush(&mut spi).unwrap();
     cs.set_high().unwrap();
 
     info!("Received {:?}", core::str::from_utf8(received).ok());
     assert_eq!(MESSAGE, received);
 
+    // Switch between 8 and 16 bit frames on the fly
+    const TX_16B: &[u16] = &[0xf00f, 0xfeef, 0xfaaf];
+    let rx_16b = &mut [0u16; TX_16B.len()];
+
     cs.set_low().unwrap();
-    embedded_hal::blocking::spi::Write::write(&mut spi, MESSAGE).unwrap();
+    SpiBus::transfer(&mut spi, rx_16b, TX_16B).unwrap();
+    SpiBus::<u16>::flush(&mut spi).unwrap();
     cs.set_high().unwrap();
+    info!("Received {:?}", rx_16b);
+    assert_eq!(TX_16B, rx_16b);
+
+    cs.set_low().unwrap();
+    SpiBus::transfer_in_place(&mut spi, rx_16b).unwrap();
+    SpiBus::<u16>::flush(&mut spi).unwrap();
+    cs.set_high().unwrap();
+    info!("Received {:?}", rx_16b);
+    assert_eq!(TX_16B, rx_16b);
 
     loop {
         cortex_m::asm::nop();

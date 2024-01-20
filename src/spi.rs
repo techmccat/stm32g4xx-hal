@@ -275,6 +275,19 @@ macro_rules! spi {
                     _ => 0,
                 }
             }
+            fn flush_inner(&mut self) -> Result<(), Error> {
+                // stop receiving data
+                self.set_tx_only();
+                self.spi.cr2.modify(|_, w| w.frxth().set_bit());
+                // drain rx fifo
+                while match self.nb_read::<u8>() {
+                    Ok(_) => true,
+                    Err(nb::Error::WouldBlock) => false,
+                    Err(nb::Error::Other(e)) => { return Err(e) }
+                } { core::hint::spin_loop() };
+                // wait for idle
+                Ok(while self.spi.sr.read().bsy().bit() { core::hint::spin_loop() })
+            }
         }
 
         impl SpiExt<$SPIX> for $SPIX {
@@ -291,13 +304,13 @@ macro_rules! spi {
             type Error = Error;
         }
 
-        impl<PINS> embedded_hal_one::spi::SpiBus for Spi<$SPIX, PINS> {
+        impl<PINS> embedded_hal_one::spi::SpiBus<u8> for Spi<$SPIX, PINS> {
             fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
                 let len = words.len();
                 if len == 0 { return Ok(()) }
 
                 // flush data from previous operations, otherwise we'd get unwanted data
-                self.flush()?;
+                self.flush_inner()?;
                 // FIFO threshold to 16 bits
                 self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
                 self.set_bidi();
@@ -312,9 +325,7 @@ macro_rules! spi {
                 }
 
                 for r in words.chunks_exact_mut(2).take(half_len - prefill) {
-                    let r_two: u16 = unsafe {
-                        nb::block!(self.nb_read_no_err()).unwrap_unchecked()
-                    };
+                    let r_two: u16 = nb::block!(self.nb_read_no_err()).unwrap();
                     nb::block!(self.nb_write(0u16))?;
                     // safety: chunks have exact length of 2
                     unsafe { *r.as_mut_ptr().cast() = r_two.to_le_bytes(); }
@@ -347,6 +358,7 @@ macro_rules! spi {
                     return self.read(read)
                 }
 
+                self.flush_inner()?;
                 self.set_bidi();
                 let common_len = core::cmp::min(read.len(), write.len());
                 let half_len = common_len / 2;
@@ -372,9 +384,7 @@ macro_rules! spi {
                 // write ahead of reading
                 let zipped = read.chunks_exact_mut(2).zip(write_iter).take(half_len - prefill);
                 for (r, w) in zipped {
-                    let r_two: u16 = unsafe {
-                        nb::block!(self.nb_read_no_err()).unwrap_unchecked()
-                    };
+                    let r_two: u16 = nb::block!(self.nb_read_no_err()).unwrap();
                     nb::block!(self.nb_write(w))?;
                     // same as above, length is checked by chunks_exact
                     unsafe { *r.as_mut_ptr().cast() = r_two.to_le_bytes(); }
@@ -409,6 +419,7 @@ macro_rules! spi {
                 let len = words.len();
                 if len == 0 { return Ok(()) }
 
+                self.flush_inner()?;
                 self.set_bidi();
                 self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
                 let half_len = len / 2;
@@ -426,7 +437,7 @@ macro_rules! spi {
 
                 // data is in fifo isn't zero as long as words.len() > 1 so read-then-write is fine
                 for i in 0..words_alias.len() - prefill {
-                    let read: u16 = unsafe { nb::block!(self.nb_read_no_err()).unwrap_unchecked() };
+                    let read: u16 = nb::block!(self.nb_read_no_err()).unwrap();
                     words_alias[i] = read.to_le_bytes();
                     let write = u16::from_le_bytes(words_alias[i + prefill]);
                     nb::block!(self.nb_write(write))?;
@@ -450,16 +461,99 @@ macro_rules! spi {
                 })
             }
             fn flush(&mut self) -> Result<(), Self::Error> {
-                // stop receiving data
+                self.flush_inner()
+            }
+        }
+        impl<PINS> embedded_hal_one::spi::SpiBus<u16> for Spi<$SPIX, PINS> {
+            fn read(&mut self, words: &mut [u16]) -> Result<(), Self::Error> {
+                let len = words.len();
+                if len == 0 { return Ok(()) }
+                // flush data from previous operations, otherwise we'd get unwanted data
+                self.flush_inner()?;
+                // FIFO threshold to 16 bits
+                self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
+                self.set_bidi();
+                // prefill write fifo so that the clock doen't stop while fetch the read byte
+                let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, len);
+                for _ in 0..prefill {
+                    nb::block!(self.nb_write(0u16))?;
+                }
+
+                for w in &mut words[..len-prefill] {
+                    *w = nb::block!(self.nb_read_no_err()).unwrap();
+                    nb::block!(self.nb_write(0u16))?;
+                }
+                Ok(for w in &mut words[len-prefill..] {
+                    *w = nb::block!(self.nb_read())?;
+                })
+            }
+            fn write(&mut self, words: &[u16]) -> Result<(), Self::Error> {
                 self.set_tx_only();
-                // drain rx fifo
-                while match self.nb_read::<u8>() {
-                    Ok(_) => true,
-                    Err(nb::Error::WouldBlock) => false,
-                    Err(nb::Error::Other(e)) => { return Err(e) }
-                } { core::hint::spin_loop() };
-                // wait for idle
-                Ok(while self.spi.sr.read().bsy().bit() { core::hint::spin_loop() })
+                Ok(for w in words {
+                    nb::block!(self.nb_write(*w))?
+                })
+            }
+            fn transfer(&mut self, read: &mut [u16], write: &[u16]) -> Result<(), Self::Error> {
+                if read.len() == 0 {
+                    return self.write(write)
+                } else if write.len() == 0 {
+                    return self.read(read)
+                }
+
+                self.flush_inner()?;
+                // FIFO threshold to 16 bits
+                self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
+                self.set_bidi();
+                let common_len = core::cmp::min(read.len(), write.len());
+                // same prefill as in read, this time with actual data
+                let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, common_len);
+
+                let mut write_iter = write.into_iter();
+                for w in write_iter.by_ref().take(prefill) {
+                    nb::block!(self.nb_write(*w))?;
+                }
+
+                let zipped = read.into_iter().zip(write_iter).take(common_len - prefill);
+                for (r, w) in zipped {
+                    *r = nb::block!(self.nb_read_no_err()).unwrap();
+                    nb::block!(self.nb_write(*w))?;
+                }
+
+                for r in &mut read[common_len - prefill..common_len] {
+                    *r = nb::block!(self.nb_read())?
+                }
+
+                if read.len() > common_len {
+                    self.read(&mut read[common_len..])
+                } else {
+                    self.write(&write[common_len..])
+                }
+            }
+            fn transfer_in_place(&mut self, words: &mut [u16]) -> Result<(), Self::Error> {
+                let len = words.len();
+                if len == 0 { return Ok(()) }
+
+                self.flush_inner()?;
+                self.set_bidi();
+                self.spi.cr2.modify(|_, w| w.frxth().clear_bit());
+                let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, len);
+
+                for w in &words[..prefill] {
+                    nb::block!(self.nb_write(*w))?;
+                }
+
+                for read_idx in 0..len - prefill {
+                    let write_idx = read_idx + prefill;
+                    words[read_idx] = nb::block!(self.nb_read_no_err()).unwrap();
+                    nb::block!(self.nb_write(words[write_idx]))?;
+                }
+
+                Ok(for r in &mut words[len - prefill..] {
+                    *r = nb::block!(self.nb_read())?;
+                })
+            }
+            fn flush(&mut self) -> Result<(), Self::Error> {
+                self.flush_inner()
             }
         }
 
