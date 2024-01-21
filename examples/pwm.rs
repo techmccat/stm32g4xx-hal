@@ -11,6 +11,7 @@ use hal::stm32;
 use hal::time::RateExtU32;
 use stm32g4xx_hal as hal;
 extern crate cortex_m_rt as rt;
+use embedded_hal_one::pwm::SetDutyCycle;
 
 #[macro_use]
 mod utils;
@@ -26,8 +27,9 @@ fn main() -> ! {
 
     let mut pwm = dp.TIM1.pwm(pin, 100.Hz(), &mut rcc);
 
-    pwm.set_duty(pwm.get_max_duty() / 2);
+    // TODO: maybe also have Pwm::enable() as a method outside the trait?
     pwm.enable();
+    pwm.set_duty_cycle_fraction(1, 3).unwrap();
 
     loop {
         cortex_m::asm::nop()
