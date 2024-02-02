@@ -11,7 +11,7 @@ use hal::stm32;
 use hal::time::RateExtU32;
 use stm32g4xx_hal as hal;
 extern crate cortex_m_rt as rt;
-use embedded_hal_one::pwm::SetDutyCycle;
+use embedded_hal::pwm::SetDutyCycle;
 
 #[macro_use]
 mod utils;

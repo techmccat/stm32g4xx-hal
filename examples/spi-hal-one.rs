@@ -17,7 +17,6 @@ use crate::hal::{
 };
 
 use cortex_m_rt::entry;
-use embedded_hal_one::spi::SpiBus;
 use stm32g4xx_hal as hal;
 
 #[macro_use]
@@ -58,7 +57,7 @@ fn main() -> ! {
     let received = &mut [0u8; MESSAGE.len()];
 
     cs.set_low().unwrap();
-    SpiBus::transfer(&mut spi, received, MESSAGE).unwrap();
+    spi.transfer(received, MESSAGE).unwrap();
     // downside of having 8 and 16 bit impls on the same struct is you have to specify which flush
     // impl to call, although internally they call the same function
     SpiBus::<u8>::flush(&mut spi).unwrap();
@@ -80,16 +79,19 @@ fn main() -> ! {
     let rx_16b = &mut [0u16; TX_16B.len()];
 
     cs.set_low().unwrap();
-    SpiBus::transfer(&mut spi, rx_16b, TX_16B).unwrap();
+    spi.transfer(rx_16b, TX_16B).unwrap();
+    // internally works the same as SpiBus::<u8>::flush()
     SpiBus::<u16>::flush(&mut spi).unwrap();
     cs.set_high().unwrap();
+
     info!("Received {:?}", rx_16b);
     assert_eq!(TX_16B, rx_16b);
 
     cs.set_low().unwrap();
-    SpiBus::transfer_in_place(&mut spi, rx_16b).unwrap();
+    spi.transfer_in_place(rx_16b).unwrap();
     SpiBus::<u16>::flush(&mut spi).unwrap();
     cs.set_high().unwrap();
+
     info!("Received {:?}", rx_16b);
     assert_eq!(TX_16B, rx_16b);
 
