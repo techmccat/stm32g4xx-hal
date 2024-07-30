@@ -1,6 +1,6 @@
 //! I2C
-use embedded_hal_old::blocking::i2c::{Read, Write, WriteRead};
 use embedded_hal::i2c::{ErrorKind, Operation, SevenBitAddress, TenBitAddress};
+use embedded_hal_old::blocking::i2c::{Read, Write, WriteRead};
 
 use crate::gpio::{gpioa::*, gpiob::*, gpioc::*, gpiof::*};
 #[cfg(any(
@@ -12,7 +12,7 @@ use crate::gpio::{gpioa::*, gpiob::*, gpioc::*, gpiof::*};
 ))]
 use crate::gpio::{gpiog::*, AF3};
 use crate::gpio::{AlternateOD, AF2, AF4, AF8};
-use crate::rcc::{Enable, GetBusFreq, Rcc, RccBus, Reset};
+use crate::rcc::{self, Rcc};
 #[cfg(any(
     feature = "stm32g471",
     feature = "stm32g473",
@@ -135,7 +135,7 @@ impl embedded_hal::i2c::Error for Error {
             Self::Nack => ErrorKind::NoAcknowledge(embedded_hal::i2c::NoAcknowledgeSource::Unknown),
             Self::PECError => ErrorKind::Other,
             Self::BusError => ErrorKind::Bus,
-            Self::ArbitrationLost => ErrorKind::ArbitrationLoss
+            Self::ArbitrationLost => ErrorKind::ArbitrationLoss,
         }
     }
 }
@@ -186,6 +186,13 @@ macro_rules! busy_wait {
     };
 }
 
+pub trait Instance: crate::Sealed + rcc::Enable + rcc::Reset + rcc::GetBusFreq {
+    const PTR: *const crate::stm32::i2c1::RegisterBlock;
+    fn registers(&self) -> &crate::stm32::i2c1::RegisterBlock {
+        unsafe { &*Self::PTR }
+    }
+}
+
 macro_rules! i2c {
     ($I2CX:ident, $i2cx:ident,
         sda: [ $($( #[ $pmetasda:meta ] )* $PSDA:ty,)+ ],
@@ -201,241 +208,270 @@ macro_rules! i2c {
             impl SCLPin<$I2CX> for $PSCL {}
         )+
 
-        impl I2cExt<$I2CX> for $I2CX {
-            fn i2c<SDA, SCL>(
-                self,
-                sda: SDA,
-                scl: SCL,
-                config: Config,
-                rcc: &mut Rcc,
-            ) -> I2c<$I2CX, SDA, SCL>
-            where
-                SDA: SDAPin<$I2CX>,
-                SCL: SCLPin<$I2CX>,
-            {
-                I2c::$i2cx(self, sda, scl, config, rcc)
-            }
+        impl Instance for $I2CX {
+            const PTR: *const crate::stm32::i2c1::RegisterBlock = $I2CX::PTR as *const crate::stm32::i2c1::RegisterBlock;
+        }
+    }
+}
+
+impl<I2C: Instance> I2cExt<I2C> for I2C {
+    fn i2c<SDA, SCL>(self, sda: SDA, scl: SCL, config: Config, rcc: &mut Rcc) -> I2c<I2C, SDA, SCL>
+    where
+        SDA: SDAPin<I2C>,
+        SCL: SCLPin<I2C>,
+    {
+        I2c::i2c(self, sda, scl, config, rcc)
+    }
+}
+
+impl<SDA, SCL, I2C> I2c<I2C, SDA, SCL>
+where
+    I2C: Instance,
+    SDA: SDAPin<I2C>,
+    SCL: SCLPin<I2C>,
+{
+    /// Initializes the I2C peripheral.
+    pub fn i2c(i2c: I2C, sda: SDA, scl: SCL, config: Config, rcc: &mut Rcc) -> Self
+    where
+        SDA: SDAPin<I2C>,
+        SCL: SCLPin<I2C>,
+    {
+        // Enable and reset I2C
+        unsafe {
+            let rcc_ptr = &(*RCC::ptr());
+            I2C::enable(rcc_ptr);
+            I2C::reset(rcc_ptr);
         }
 
-        impl<SDA, SCL> I2c<$I2CX, SDA, SCL> where
-            SDA: SDAPin<$I2CX>,
-            SCL: SCLPin<$I2CX>
-        {
-            /// Initializes the I2C peripheral.
-            pub fn $i2cx(i2c: $I2CX, sda: SDA, scl: SCL, config: Config, rcc: &mut Rcc) -> Self
-            where
-                SDA: SDAPin<$I2CX>,
-                SCL: SCLPin<$I2CX>,
-            {
-                // Enable and reset I2C
-                unsafe {
-                    let rcc_ptr = &(*RCC::ptr());
-                    $I2CX::enable(rcc_ptr);
-                    $I2CX::reset(rcc_ptr);
-                }
+        // Make sure the I2C unit is disabled so we can configure it
+        i2c.registers().cr1.modify(|_, w| w.pe().clear_bit());
 
-                // Make sure the I2C unit is disabled so we can configure it
-                i2c.cr1.modify(|_, w| w.pe().clear_bit());
+        // Setup protocol timings
+        let timing_bits = config.timing_bits(I2C::get_frequency(&rcc.clocks));
+        i2c.registers()
+            .timingr
+            .write(|w| unsafe { w.bits(timing_bits) });
 
-                // Setup protocol timings
-                let timing_bits = config.timing_bits(<$I2CX as RccBus>::Bus::get_frequency(&rcc.clocks));
-                i2c.timingr.write(|w| unsafe { w.bits(timing_bits) });
+        // Enable the I2C processing
+        i2c.registers().cr1.modify(|_, w| {
+            w.pe()
+                .set_bit()
+                .dnf()
+                .bits(config.digital_filter)
+                .anfoff()
+                .bit(!config.analog_filter)
+        });
 
-                // Enable the I2C processing
-                i2c.cr1.modify(|_, w| {
-                    w.pe()
-                        .set_bit()
-                        .dnf()
-                        .bits(config.digital_filter)
-                        .anfoff()
-                        .bit(!config.analog_filter)
-                });
+        I2c { i2c, sda, scl }
+    }
 
-                I2c { i2c, sda, scl }
-            }
-
-            /// Disables I2C and releases the peripheral as well as the pins.
-            pub fn release(self) -> ($I2CX, SDA, SCL) {
-                // Disable I2C.
-                unsafe {
-                    let rcc_ptr = &(*RCC::ptr());
-                    $I2CX::reset(rcc_ptr);
-                    $I2CX::disable(rcc_ptr);
-                }
-
-                (self.i2c, self.sda, self.scl)
-            }
+    /// Disables I2C and releases the peripheral as well as the pins.
+    pub fn release(self) -> (I2C, SDA, SCL) {
+        // Disable I2C.
+        unsafe {
+            let rcc_ptr = &(*RCC::ptr());
+            I2C::reset(rcc_ptr);
+            I2C::disable(rcc_ptr);
         }
 
-        impl<SDA, SCL> I2c<$I2CX, SDA, SCL> {
-            // copied from f3 hal
-            fn read_inner(&mut self, mut addr: u16, addr_10b: bool, buffer: &mut [u8]) -> Result<(), Error> {
-                if !addr_10b { addr <<= 1 };
-                let end = buffer.len() / 0xFF;
+        (self.i2c, self.sda, self.scl)
+    }
 
-                // Process 255 bytes at a time
-                for (i, buffer) in buffer.chunks_mut(0xFF).enumerate() {
-                    // Prepare to receive `bytes`
-                    self.i2c.cr2.modify(|_, w| {
-                        if i == 0 {
-                            w.add10().bit(addr_10b);
-                            w.sadd().bits(addr);
-                            w.rd_wrn().read();
-                            w.start().start();
-                        }
-                        w.nbytes().bits(buffer.len() as u8);
-                        if i == end {
-                            w.reload().completed().autoend().automatic()
-                        } else {
-                            w.reload().not_completed()
-                        }
-                    });
+    // copied from f3 hal
+    fn read_inner(
+        &mut self,
+        mut addr: u16,
+        addr_10b: bool,
+        buffer: &mut [u8],
+    ) -> Result<(), Error> {
+        if !addr_10b {
+            addr <<= 1
+        };
+        let end = buffer.len() / 0xFF;
 
-                    for byte in buffer {
-                        // Wait until we have received something
-                        busy_wait!(self.i2c, rxne, is_not_empty);
-                        *byte = self.i2c.rxdr.read().rxdata().bits();
-                    }
-
-                    if i != end {
-                        // Wait until the last transmission is finished
-                        busy_wait!(self.i2c, tcr, is_complete);
-                    }
+        // Process 255 bytes at a time
+        for (i, buffer) in buffer.chunks_mut(0xFF).enumerate() {
+            // Prepare to receive `bytes`
+            self.i2c.registers().cr2.modify(|_, w| {
+                if i == 0 {
+                    w.add10().bit(addr_10b);
+                    w.sadd().bits(addr);
+                    w.rd_wrn().read();
+                    w.start().start();
                 }
+                w.nbytes().bits(buffer.len() as u8);
+                if i == end {
+                    w.reload().completed().autoend().automatic()
+                } else {
+                    w.reload().not_completed()
+                }
+            });
 
+            for byte in buffer {
+                // Wait until we have received something
+                busy_wait!(self.i2c.registers(), rxne, is_not_empty);
+                *byte = self.i2c.registers().rxdr.read().rxdata().bits();
+            }
+
+            if i != end {
                 // Wait until the last transmission is finished
-                // auto stop is set
-                busy_wait!(self.i2c, stopf, is_stop);
-                Ok(self.i2c.icr.write(|w| w.stopcf().clear()))
+                busy_wait!(self.i2c.registers(), tcr, is_complete);
+            }
+        }
+
+        // Wait until the last transmission is finished
+        // auto stop is set
+        busy_wait!(self.i2c.registers(), stopf, is_stop);
+        Ok(self.i2c.registers().icr.write(|w| w.stopcf().clear()))
+    }
+
+    fn write_inner(&mut self, mut addr: u16, addr_10b: bool, buffer: &[u8]) -> Result<(), Error> {
+        if !addr_10b {
+            addr <<= 1
+        };
+        let end = buffer.len() / 0xFF;
+
+        if buffer.is_empty() {
+            // 0 byte write
+            self.i2c.registers().cr2.modify(|_, w| {
+                w.add10().bit(addr_10b);
+                w.sadd().bits(addr);
+                w.rd_wrn().write();
+                w.nbytes().bits(0);
+                w.reload().completed();
+                w.autoend().automatic();
+                w.start().start()
+            });
+            return Ok(());
+        }
+        // Process 255 bytes at a time
+        for (i, buffer) in buffer.chunks(0xFF).enumerate() {
+            // Prepare to receive `bytes`
+            self.i2c.registers().cr2.modify(|_, w| {
+                if i == 0 {
+                    w.add10().bit(addr_10b);
+                    w.sadd().bits(addr);
+                    w.rd_wrn().write();
+                    w.start().start();
+                }
+                w.nbytes().bits(buffer.len() as u8);
+                if i == end {
+                    w.reload().completed().autoend().automatic()
+                } else {
+                    w.reload().not_completed()
+                }
+            });
+
+            for byte in buffer {
+                // Wait until we are allowed to send data
+                // (START has been ACKed or last byte went through)
+                busy_wait!(self.i2c.registers(), txis, is_empty);
+                self.i2c.registers().txdr.write(|w| w.txdata().bits(*byte));
             }
 
-            fn write_inner(&mut self, mut addr: u16, addr_10b: bool, buffer: &[u8]) -> Result<(), Error> {
-                if !addr_10b { addr <<= 1 };
-                let end = buffer.len() / 0xFF;
-
-                if buffer.is_empty() {
-                    // 0 byte write
-                    self.i2c.cr2.modify(|_, w| {
-                        w.add10().bit(addr_10b);
-                        w.sadd().bits(addr);
-                        w.rd_wrn().write();
-                        w.nbytes().bits(0);
-                        w.reload().completed();
-                        w.autoend().automatic();
-                        w.start().start()
-                    });
-                    return Ok(())
-                }
-                // Process 255 bytes at a time
-                for (i, buffer) in buffer.chunks(0xFF).enumerate() {
-                    // Prepare to receive `bytes`
-                    self.i2c.cr2.modify(|_, w| {
-                        if i == 0 {
-                            w.add10().bit(addr_10b);
-                            w.sadd().bits(addr);
-                            w.rd_wrn().write();
-                            w.start().start();
-                        }
-                        w.nbytes().bits(buffer.len() as u8);
-                        if i == end {
-                            w.reload().completed().autoend().automatic()
-                        } else {
-                            w.reload().not_completed()
-                        }
-                    });
-
-                    for byte in buffer {
-                        // Wait until we are allowed to send data
-                        // (START has been ACKed or last byte went through)
-                        busy_wait!(self.i2c, txis, is_empty);
-                        self.i2c.txdr.write(|w| w.txdata().bits(*byte));
-                    }
-
-                    if i != end {
-                        // Wait until the last transmission is finished
-                        busy_wait!(self.i2c, tcr, is_complete);
-                    }
-                }
-
+            if i != end {
                 // Wait until the last transmission is finished
-                // auto stop is set
-                busy_wait!(self.i2c, stopf, is_stop);
-                Ok(self.i2c.icr.write(|w| w.stopcf().clear()))
+                busy_wait!(self.i2c.registers(), tcr, is_complete);
             }
         }
 
-        impl<SDA, SCL> embedded_hal::i2c::ErrorType for I2c<$I2CX, SDA, SCL> {
-            type Error = Error;
-        }
+        // Wait until the last transmission is finished
+        // auto stop is set
+        busy_wait!(self.i2c.registers(), stopf, is_stop);
+        Ok(self.i2c.registers().icr.write(|w| w.stopcf().clear()))
+    }
+}
 
-        // TODO: custom read/write/read_write impl with hardware stop logic
-        impl<SDA, SCL> embedded_hal::i2c::I2c for I2c<$I2CX, SDA, SCL> {
-            fn transaction(
-                &mut self,
-                address: SevenBitAddress,
-                operation: &mut [Operation<'_>]
-            ) -> Result<(), Self::Error> {
-                Ok(for op in operation {
-                    // Wait for any operation on the bus to finish
-                    // for example in the case of another bus master having claimed the bus
-                    while self.i2c.isr.read().busy().bit_is_set() {};
-                    match op {
-                        Operation::Read(data) => self.read_inner(address as u16, false, data)?,
-                        Operation::Write(data) => self.write_inner(address as u16, false, data)?,
-                    }
-                })
+impl<I2C, SDA, SCL> embedded_hal::i2c::ErrorType for I2c<I2C, SDA, SCL> {
+    type Error = Error;
+}
+
+// TODO: custom read/write/read_write impl with hardware stop logic
+impl<I2C, SDA, SCL> embedded_hal::i2c::I2c for I2c<I2C, SDA, SCL>
+where
+    I2C: Instance,
+    SDA: SDAPin<I2C>,
+    SCL: SCLPin<I2C>,
+{
+    fn transaction(
+        &mut self,
+        address: SevenBitAddress,
+        operation: &mut [Operation<'_>],
+    ) -> Result<(), Self::Error> {
+        Ok(for op in operation {
+            // Wait for any operation on the bus to finish
+            // for example in the case of another bus master having claimed the bus
+            while self.i2c.registers().isr.read().busy().bit_is_set() {}
+            match op {
+                Operation::Read(data) => self.read_inner(address as u16, false, data)?,
+                Operation::Write(data) => self.write_inner(address as u16, false, data)?,
             }
-        }
-        impl<SDA, SCL> embedded_hal::i2c::I2c<TenBitAddress> for I2c<$I2CX, SDA, SCL> {
-            fn transaction(
-                &mut self,
-                address: TenBitAddress,
-                operation: &mut [Operation<'_>]
-            ) -> Result<(), Self::Error> {
-                Ok(for op in operation {
-                    // Wait for any operation on the bus to finish
-                    // for example in the case of another bus master having claimed the bus
-                    while self.i2c.isr.read().busy().bit_is_set() {};
-                    match op {
-                        Operation::Read(data) => self.read_inner(address, true, data)?,
-                        Operation::Write(data) => self.write_inner(address, true, data)?,
-                    }
-                })
+        })
+    }
+}
+impl<I2C, SDA, SCL> embedded_hal::i2c::I2c<TenBitAddress> for I2c<I2C, SDA, SCL>
+where
+    I2C: Instance,
+    SDA: SDAPin<I2C>,
+    SCL: SCLPin<I2C>,
+{
+    fn transaction(
+        &mut self,
+        address: TenBitAddress,
+        operation: &mut [Operation<'_>],
+    ) -> Result<(), Self::Error> {
+        Ok(for op in operation {
+            // Wait for any operation on the bus to finish
+            // for example in the case of another bus master having claimed the bus
+            while self.i2c.registers().isr.read().busy().bit_is_set() {}
+            match op {
+                Operation::Read(data) => self.read_inner(address, true, data)?,
+                Operation::Write(data) => self.write_inner(address, true, data)?,
             }
-        }
+        })
+    }
+}
 
-        impl<SDA, SCL> WriteRead for I2c<$I2CX, SDA, SCL> {
-            type Error = Error;
+impl<I2C, SDA, SCL> WriteRead for I2c<I2C, SDA, SCL>
+where
+    I2C: Instance,
+    SDA: SDAPin<I2C>,
+    SCL: SCLPin<I2C>,
+{
+    type Error = Error;
 
-            fn write_read(
-                &mut self,
-                addr: u8,
-                bytes: &[u8],
-                buffer: &mut [u8],
-            ) -> Result<(), Self::Error> {
-                self.write_inner(addr as u16, false, bytes)?;
-                self.read_inner(addr as u16, false, buffer)?;
-                Ok(())
-            }
-        }
+    fn write_read(&mut self, addr: u8, bytes: &[u8], buffer: &mut [u8]) -> Result<(), Self::Error> {
+        self.write_inner(addr as u16, false, bytes)?;
+        self.read_inner(addr as u16, false, buffer)?;
+        Ok(())
+    }
+}
 
-        impl<SDA, SCL> Write for I2c<$I2CX, SDA, SCL> {
-            type Error = Error;
+impl<I2C, SDA, SCL> Write for I2c<I2C, SDA, SCL>
+where
+    I2C: Instance,
+    SDA: SDAPin<I2C>,
+    SCL: SCLPin<I2C>,
+{
+    type Error = Error;
 
-            fn write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), Self::Error> {
-                self.write_inner(addr as u16, false, bytes)?;
-                Ok(())
-            }
-        }
+    fn write(&mut self, addr: u8, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.write_inner(addr as u16, false, bytes)?;
+        Ok(())
+    }
+}
 
-        impl<SDA, SCL> Read for I2c<$I2CX, SDA, SCL> {
-            type Error = Error;
+impl<I2C, SDA, SCL> Read for I2c<I2C, SDA, SCL>
+where
+    I2C: Instance,
+    SDA: SDAPin<I2C>,
+    SCL: SCLPin<I2C>,
+{
+    type Error = Error;
 
-            fn read(&mut self, addr: u8, bytes: &mut [u8]) -> Result<(), Self::Error> {
-                self.read_inner(addr as u16, false, bytes)?;
-                Ok(())
-            }
-        }
+    fn read(&mut self, addr: u8, bytes: &mut [u8]) -> Result<(), Self::Error> {
+        self.read_inner(addr as u16, false, bytes)?;
+        Ok(())
     }
 }
 
