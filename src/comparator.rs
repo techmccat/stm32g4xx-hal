@@ -9,32 +9,10 @@ use core::marker::PhantomData;
 
 use crate::dac;
 use crate::exti::{Event as ExtiEvent, ExtiExt};
-use crate::gpio::{
-    gpioa::{PA0, PA1, PA11, PA12, PA2, PA3, PA4, PA5, PA6, PA7},
-    gpiob::{PB0, PB1, PB14, PB15, PB2, PB6, PB7, PB8, PB9},
-    gpioc::PC2,
-    gpiof::PF4,
-    Analog, OpenDrain, Output, PushPull, SignalEdge, AF2, AF3, AF8,
-};
+use crate::gpio::{self, Analog, OpenDrain, Output, PushPull, SignalEdge};
 
-#[cfg(any(
-    feature = "stm32g473",
-    feature = "stm32g483",
-    feature = "stm32g474",
-    feature = "stm32g484"
-))]
-use crate::gpio::{
-    gpioa::{PA10, PA8, PA9},
-    gpiob::{PB10, PB11, PB12, PB13},
-    gpioc::{PC6, PC7, PC8},
-    gpiod::{PD10, PD11, PD12, PD13, PD14, PD15},
-    AF7,
-};
-
-use crate::gpio::gpioc::{PC0, PC1};
-use crate::gpio::gpioe::{PE7, PE8};
-use crate::gpio::gpiof::PF1;
 use crate::rcc::{Clocks, Rcc};
+use crate::stasis;
 use crate::stm32::{COMP, EXTI};
 
 /// Enabled Comparator (type state)
@@ -55,26 +33,26 @@ impl EnabledState for Enabled {}
 impl EnabledState for Locked {}
 
 macro_rules! impl_comp {
-    ($($t:ident: $reg_t:ident, $reg:ident,)+) => {$(
+    ($($t:ident: $reg:ident,)+) => {$(
         pub struct $t {
             _rb: PhantomData<()>,
         }
 
         impl $t {
-            pub fn csr(&self) -> &$crate::stm32::comp::$reg_t {
+            pub fn csr(&self) -> &$crate::stm32::comp::CCSR {
                 // SAFETY: The COMP1 type is only constructed with logical ownership of
                 // these registers.
-                &unsafe { &*COMP::ptr() }.$reg
+                &unsafe { &*COMP::ptr() }.$reg()
             }
         }
     )+};
 }
 
 impl_comp! {
-    COMP1: C1CSR, c1csr,
-    COMP2: C2CSR, c2csr,
-    COMP3: C3CSR, c3csr,
-    COMP4: C4CSR, c4csr,
+    COMP1: c1csr,
+    COMP2: c2csr,
+    COMP3: c3csr,
+    COMP4: c4csr,
 }
 #[cfg(any(
     feature = "stm32g473",
@@ -83,9 +61,9 @@ impl_comp! {
     feature = "stm32g484"
 ))]
 impl_comp! {
-    COMP5: C5CSR, c5csr,
-    COMP6: C6CSR, c6csr,
-    COMP7: C7CSR, c7csr,
+    COMP5: c5csr,
+    COMP6: c6csr,
+    COMP7: c7csr,
 }
 
 // TODO: Split COMP in PAC
@@ -140,35 +118,35 @@ pub enum Hysteresis {
 
 /// Comparator positive input
 pub trait PositiveInput<C> {
-    fn setup(&self, comp: &C);
+    fn setup(s: impl stasis::EntitlementLock<Resource = Self>, comp: &mut C);
 }
 
 /// Comparator negative input
 pub trait NegativeInput<C> {
     /// Does this input use the internal reference Vrefint
     ///
-    /// This only true for RefintInput
+    /// This only true for [`RefintInput`]
     const USE_VREFINT: bool;
 
     /// Does this input rely on dividing Vrefint using an internal resistor divider
     ///
-    /// This is only relevant for `RefintInput` other than `RefintInput::VRefint`
-    fn use_resistor_divider(&self) -> bool;
+    /// This is only relevant for [`RefintInput`] other than [`refint_input::VRefint`]
+    const USE_RESISTOR_DIVIDER: bool = false;
 
-    fn setup(&self, comp: &C);
+    fn setup(s: impl stasis::EntitlementLock<Resource = Self>, comp: &mut C);
 }
 
 macro_rules! positive_input_pin {
     ($COMP:ident, $pin_0:ident, $pin_1:ident) => {
-        impl PositiveInput<$COMP> for &$pin_0<Analog> {
-            fn setup(&self, comp: &$COMP) {
-                comp.csr().modify(|_, w| w.inpsel().bit(false))
+        impl PositiveInput<$COMP> for gpio::$pin_0<Analog> {
+            fn setup(_s: impl stasis::EntitlementLock<Resource = Self>, comp: &mut $COMP) {
+                comp.csr().modify(|_, w| w.inpsel().bit(false));
             }
         }
 
-        impl PositiveInput<$COMP> for &$pin_1<Analog> {
-            fn setup(&self, comp: &$COMP) {
-                comp.csr().modify(|_, w| w.inpsel().bit(true))
+        impl PositiveInput<$COMP> for gpio::$pin_1<Analog> {
+            fn setup(_s: impl stasis::EntitlementLock<Resource = Self>, comp: &mut $COMP) {
+                comp.csr().modify(|_, w| w.inpsel().bit(true));
             }
         }
     };
@@ -208,12 +186,8 @@ macro_rules! negative_input_pin_helper {
         impl NegativeInput<$COMP> for $input {
             const USE_VREFINT: bool = false;
 
-            fn use_resistor_divider(&self) -> bool {
-                false
-            }
-
-            fn setup(&self, comp: &$COMP) {
-                comp.csr().modify(|_, w| unsafe { w.inmsel().bits($bits) })
+            fn setup(_s: impl stasis::EntitlementLock<Resource = Self>, comp: &mut $COMP) {
+                comp.csr().modify(|_, w| unsafe { w.inmsel().bits($bits) });
             }
         }
     };
@@ -227,10 +201,10 @@ macro_rules! negative_input_pin {
 }
 
 negative_input_pin! {
-    COMP1: PA4<Analog>, PA0<Analog>,
-    COMP2: PA5<Analog>, PA2<Analog>,
-    COMP3: PF1<Analog>, PC0<Analog>,
-    COMP4: PE8<Analog>, PB2<Analog>,
+    COMP1: gpio::PA4<Analog>, gpio::PA0<Analog>,
+    COMP2: gpio::PA5<Analog>, gpio::PA2<Analog>,
+    COMP3: gpio::PF1<Analog>, gpio::PC0<Analog>,
+    COMP4: gpio::PE8<Analog>, gpio::PB2<Analog>,
 }
 
 #[cfg(any(
@@ -240,35 +214,58 @@ negative_input_pin! {
     feature = "stm32g484"
 ))]
 negative_input_pin! {
-    COMP5: PB10<Analog>, PD13<Analog>,
-    COMP6: PD10<Analog>, PB15<Analog>,
-    COMP7: PD15<Analog>, PB12<Analog>,
+    COMP5: gpio::PB10<Analog>, gpio::PD13<Analog>,
+    COMP6: gpio::PD10<Analog>, gpio::PB15<Analog>,
+    COMP7: gpio::PD15<Analog>, gpio::PB12<Analog>,
 }
 
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub enum RefintInput {
+pub mod refint_input {
     /// VRefint * 1/4
-    VRefintM14 = 0b000,
+    #[derive(Copy, Clone)]
+    pub struct VRefintM14;
+
     /// VRefint * 1/2
-    VRefintM12 = 0b001,
+    #[derive(Copy, Clone)]
+    pub struct VRefintM12;
+
     /// VRefint * 3/4
-    VRefintM34 = 0b010,
+    #[derive(Copy, Clone)]
+    pub struct VRefintM34;
+
     /// VRefint
-    VRefint = 0b011,
+    #[derive(Copy, Clone)]
+    pub struct VRefint;
+    macro_rules! impl_vrefint {
+        ($t:ty, $bits:expr, $use_r_div:expr) => {
+            impl super::RefintInput for $t {
+                const BITS: u8 = $bits;
+                const USE_RESISTOR_DIVIDER: bool = $use_r_div;
+            }
+
+            impl crate::stasis::Freeze for $t {}
+        };
+    }
+
+    impl_vrefint!(VRefintM14, 0b000, true);
+    impl_vrefint!(VRefintM12, 0b001, true);
+    impl_vrefint!(VRefintM34, 0b010, true);
+    impl_vrefint!(VRefint, 0b011, false);
+}
+
+pub trait RefintInput {
+    const BITS: u8;
+    const USE_RESISTOR_DIVIDER: bool;
 }
 
 macro_rules! refint_input {
     ($($COMP:ident, )+) => {$(
-        impl NegativeInput<$COMP> for RefintInput {
+        impl<REF: RefintInput> NegativeInput<$COMP> for REF {
             const USE_VREFINT: bool = true;
+            const USE_RESISTOR_DIVIDER: bool = <REF as RefintInput>::USE_RESISTOR_DIVIDER;
 
-            fn use_resistor_divider(&self) -> bool {
-                *self != RefintInput::VRefint
-            }
-
-            fn setup(&self, comp: &$COMP) {
+            fn setup(_s: impl stasis::EntitlementLock<Resource = Self>, comp: &mut $COMP) {
                 comp.csr()
-                    .modify(|_, w| unsafe { w.inmsel().bits(*self as u8) })
+                    .modify(|_, w| unsafe { w.inmsel().bits(<REF as RefintInput>::BITS) });
             }
         }
     )+};
@@ -286,15 +283,11 @@ refint_input!(COMP5, COMP6, COMP7,);
 
 macro_rules! dac_input_helper {
     ($COMP:ident: $channel:ident, $MODE:ident, $bits:expr) => {
-        impl<ED> NegativeInput<$COMP> for &dac::$channel<{ dac::$MODE }, ED> {
+        impl<ED> NegativeInput<$COMP> for dac::$channel<{ dac::$MODE }, ED> {
             const USE_VREFINT: bool = false;
 
-            fn use_resistor_divider(&self) -> bool {
-                false
-            }
-
-            fn setup(&self, comp: &$COMP) {
-                comp.csr().modify(|_, w| unsafe { w.inmsel().bits($bits) })
+            fn setup(_s: impl stasis::EntitlementLock<Resource = Self>, comp: &mut $COMP) {
+                comp.csr().modify(|_, w| unsafe { w.inmsel().bits($bits) });
             }
         }
     };
@@ -371,27 +364,38 @@ pub struct Comparator<C, ED> {
 
 pub trait ComparatorExt<COMP> {
     /// Initializes a comparator
-    fn comparator<P: PositiveInput<COMP>, N: NegativeInput<COMP>>(
+    fn comparator<P, N, PP, NP>(
         self,
         positive_input: P,
         negative_input: N,
         config: Config,
         clocks: &Clocks,
-    ) -> Comparator<COMP, Disabled>;
+    ) -> Comparator<COMP, Disabled>
+    where
+        PP: PositiveInput<COMP>,
+        NP: NegativeInput<COMP>,
+        P: stasis::EntitlementLock<Resource = PP>,
+        N: stasis::EntitlementLock<Resource = NP>;
 }
 
 macro_rules! impl_comparator {
     ($COMP:ty, $comp:ident, $Event:expr) => {
         impl ComparatorExt<$COMP> for $COMP {
-            fn comparator<P: PositiveInput<$COMP>, N: NegativeInput<$COMP>>(
-                self,
-                positive_input: P,
-                negative_input: N,
+            fn comparator<P, N, PP, NP>(
+                mut self,
+                positive_input: P, // TODO: Store these
+                negative_input: N, // TODO: Store these
                 config: Config,
                 clocks: &Clocks,
-            ) -> Comparator<$COMP, Disabled> {
-                positive_input.setup(&self);
-                negative_input.setup(&self);
+            ) -> Comparator<$COMP, Disabled>
+            where
+                PP: PositiveInput<$COMP>,
+                NP: NegativeInput<$COMP>,
+                P: stasis::EntitlementLock<Resource = PP>,
+                N: stasis::EntitlementLock<Resource = NP>,
+            {
+                PP::setup(positive_input, &mut self);
+                NP::setup(negative_input, &mut self);
                 // Delay for scaler voltage bridge initialization for certain negative inputs
                 let voltage_scaler_delay = clocks.sys_clk.raw() / (1_000_000 / 200); // 200us
                 cortex_m::asm::delay(voltage_scaler_delay);
@@ -399,9 +403,9 @@ macro_rules! impl_comparator {
                     w.hyst()
                         .bits(config.hysteresis as u8)
                         .scalen()
-                        .bit(N::USE_VREFINT)
+                        .bit(NP::USE_VREFINT)
                         .brgen()
-                        .bit(negative_input.use_resistor_divider())
+                        .bit(NP::USE_RESISTOR_DIVIDER)
                         .pol()
                         .bit(config.inverted)
                 });
@@ -415,13 +419,19 @@ macro_rules! impl_comparator {
 
         impl Comparator<$COMP, Disabled> {
             /// Initializes a comparator
-            pub fn $comp<P: PositiveInput<$COMP>, N: NegativeInput<$COMP>>(
+            pub fn $comp<P, N, PP, NP>(
                 comp: $COMP,
                 positive_input: P,
                 negative_input: N,
                 config: Config,
                 clocks: &Clocks,
-            ) -> Self {
+            ) -> Self
+            where
+                PP: PositiveInput<$COMP>,
+                NP: NegativeInput<$COMP>,
+                P: stasis::EntitlementLock<Resource = PP>,
+                N: stasis::EntitlementLock<Resource = NP>,
+            {
                 comp.comparator(positive_input, negative_input, config, clocks)
             }
 
@@ -541,11 +551,11 @@ type Comparators = (COMP1, COMP2, COMP3, COMP4, COMP5, COMP6, COMP7);
 /// Enables the comparator peripheral, and splits the [`COMP`] into independent [`COMP1`] and [`COMP2`]
 pub fn split(_comp: COMP, rcc: &mut Rcc) -> Comparators {
     // Enable COMP, SYSCFG, VREFBUF clocks
-    rcc.rb.apb2enr.modify(|_, w| w.syscfgen().set_bit());
+    rcc.rb.apb2enr().modify(|_, w| w.syscfgen().set_bit());
 
     // Reset COMP, SYSCFG, VREFBUF
-    rcc.rb.apb2rstr.modify(|_, w| w.syscfgrst().set_bit());
-    rcc.rb.apb2rstr.modify(|_, w| w.syscfgrst().clear_bit());
+    rcc.rb.apb2rstr().modify(|_, w| w.syscfgrst().set_bit());
+    rcc.rb.apb2rstr().modify(|_, w| w.syscfgrst().clear_bit());
 
     (
         COMP1 { _rb: PhantomData },
@@ -593,53 +603,49 @@ pub trait OutputPin<COMP> {
 
 #[allow(unused_macros)] // TODO: add support for more devices
 macro_rules! output_pin {
-    ($COMP:ident, $pin:ident, $AF:ident, $mode_t:ident, $into:ident) => {
-        impl OutputPin<$COMP> for $pin<Output<$mode_t>> {
+    ($COMP:ident, $pin:ident, $AF:literal, $mode_t:ident, $into:ident) => {
+        impl OutputPin<$COMP> for gpio::$pin<Output<$mode_t>> {
             fn setup(self) {
                 self.$into::<$AF>();
             }
         }
     };
-    ($($COMP:ident: $pin:ident, $AF:ident,)+) => {$(
+    ($($COMP:ident: $pin:ident, $AF:literal,)+) => {$(
         output_pin!($COMP, $pin, $AF, PushPull, into_alternate);
         output_pin!($COMP, $pin, $AF, OpenDrain, into_alternate_open_drain);
     )+};
 }
 
 output_pin! {
-    COMP1: PA0,  AF8,
-    COMP1: PA6,  AF8,
-    COMP1: PA11, AF8,
-    COMP1: PB8,  AF8,
-    COMP1: PF4,  AF2,
+    COMP1: PA0,  8,
+    COMP1: PA6,  8,
+    COMP1: PA11, 8,
+    COMP1: PB8,  8,
 
-    COMP2: PA2,  AF8,
-    COMP2: PA7,  AF8,
-    COMP2: PA12, AF8,
-    COMP2: PB9,  AF8,
+    COMP2: PA2,  8,
+    COMP2: PA7,  8,
+    COMP2: PA12, 8,
+    COMP2: PB9,  8,
 
-    COMP3: PB7,  AF8,
-    COMP3: PB15, AF3,
-    COMP3: PC2,  AF3,
+    COMP3: PB7,  8,
+    COMP3: PB15, 3,
+    COMP3: PC2,  3,
 
-    COMP4: PB1,  AF8,
-    COMP4: PB6,  AF8,
-    COMP4: PB14, AF8,
+    COMP4: PB1,  8,
+    COMP4: PB6,  8,
+    COMP4: PB14, 8,
 }
 
-#[cfg(any(
-    feature = "stm32g473",
-    feature = "stm32g483",
-    feature = "stm32g474",
-    feature = "stm32g484",
-))]
+#[cfg(feature = "gpio-g47x")]
 output_pin! {
-    COMP5: PA9,  AF8,
-    COMP5: PC7,  AF7,
+    COMP1: PF4,  2,
 
-    COMP6: PA10, AF8,
-    COMP6: PC6,  AF7,
+    COMP5: PA9,  8,
+    COMP5: PC7,  7,
 
-    COMP7: PA8, AF8,
-    COMP7: PC8, AF7,
+    COMP6: PA10, 8,
+    COMP6: PC6,  7,
+
+    COMP7: PA8, 8,
+    COMP7: PC8, 7,
 }

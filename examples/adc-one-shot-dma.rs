@@ -1,24 +1,25 @@
 #![no_std]
 #![no_main]
+#![allow(clippy::uninlined_format_args)]
 
 use cortex_m_rt::entry;
 
 use crate::hal::{
     adc::{
         config::{Continuous, Dma as AdcDma, Resolution, SampleTime, Sequence},
-        AdcClaim, ClockSource, Temperature,
+        AdcClaim,
     },
-    time::ExtU32,
-    timer::Timer,
-    delay::DelayFromCountDownTimer,
-    dma::{config::DmaConfig, stream::DMAExt, TransferExt},
+    delay::SYSTDelayExt,
+    dma::{channel::DMAExt, config::DmaConfig, TransferExt},
     gpio::GpioExt,
     pwr::PwrExt,
     rcc::{Config, RccExt},
     stm32::Peripherals,
 };
-use stm32g4xx_hal as hal;
-
+use stm32g4xx_hal::{
+    self as hal,
+    adc::{temperature::Temperature, AdcCommonExt},
+};
 
 #[macro_use]
 mod utils;
@@ -31,7 +32,7 @@ fn main() -> ! {
     info!("start");
 
     let dp = Peripherals::take().unwrap();
-    // let cp = cortex_m::Peripherals::take().expect("cannot take core peripherals");
+    let cp = cortex_m::Peripherals::take().expect("cannot take core peripherals");
 
     info!("rcc");
 
@@ -39,7 +40,7 @@ fn main() -> ! {
     let pwr = dp.PWR.constrain().freeze();
     let mut rcc = rcc.freeze(Config::hsi(), pwr);
 
-    let mut streams = dp.DMA1.split(&rcc);
+    let mut channels = dp.DMA1.split(&rcc);
     let config = DmaConfig::default()
         .transfer_complete_interrupt(false)
         .circular_buffer(false)
@@ -50,15 +51,12 @@ fn main() -> ! {
     let pa0 = gpioa.pa0.into_analog();
 
     info!("Setup Adc1");
-    // let mut delay = cp.SYST.delay(&rcc.clocks);
-    let mut delay = DelayFromCountDownTimer::new(
-        Timer::new(dp.TIM6, &rcc.clocks).start_count_down(100u32.millis()),
-    );
-    let mut adc = dp
-        .ADC1
-        .claim(ClockSource::SystemClock, &rcc, &mut delay, true);
+    let mut delay = cp.SYST.delay(&rcc.clocks);
 
-    adc.enable_temperature(&dp.ADC12_COMMON);
+    let mut adc12_common = dp.ADC12_COMMON.claim(Default::default(), &mut rcc);
+    let mut adc = adc12_common.claim(dp.ADC1, &mut delay);
+
+    adc12_common.enable_temperature();
     adc.set_continuous(Continuous::Single);
     adc.reset_sequence();
     adc.configure_channel(&pa0, Sequence::One, SampleTime::Cycles_640_5);
@@ -66,7 +64,7 @@ fn main() -> ! {
 
     info!("Setup DMA");
     let first_buffer = cortex_m::singleton!(: [u16; 2] = [0; 2]).unwrap();
-    let mut transfer = streams.0.into_peripheral_to_memory_transfer(
+    let mut transfer = channels.ch1.into_peripheral_to_memory_transfer(
         adc.enable_dma(AdcDma::Single),
         &mut first_buffer[..],
         config,
@@ -79,10 +77,10 @@ fn main() -> ! {
     info!("Conversion Done");
 
     transfer.pause(|adc| adc.cancel_conversion());
-    let (s0, adc, first_buffer) = transfer.free();
+    let (ch1, adc, first_buffer) = transfer.free();
     let adc = adc.disable();
 
-    streams.0 = s0;
+    channels.ch1 = ch1;
 
     let millivolts = adc.sample_to_millivolts(first_buffer[0]);
     info!("pa3: {}mV", millivolts);

@@ -1,21 +1,23 @@
 #![no_main]
 #![no_std]
+#![allow(clippy::uninlined_format_args)]
 
 use crate::hal::{
     adc::{
         config::{Continuous, Resolution, SampleTime, Sequence},
-        AdcClaim, ClockSource, Temperature, Vref,
+        AdcClaim, Vref,
     },
-    time::ExtU32,
-    timer::Timer,
-    delay::DelayFromCountDownTimer,
+    delay::SYSTDelayExt,
     gpio::GpioExt,
     pwr::PwrExt,
     rcc::{Config, RccExt},
     signature::{VrefCal, VDDA_CALIB},
     stm32::Peripherals,
 };
-use stm32g4xx_hal as hal;
+use stm32g4xx_hal::{
+    self as hal,
+    adc::{temperature::Temperature, AdcCommonExt},
+};
 
 use cortex_m_rt::entry;
 
@@ -31,7 +33,7 @@ fn main() -> ! {
     info!("start");
 
     let dp = Peripherals::take().unwrap();
-    // let cp = cortex_m::Peripherals::take().expect("cannot take core peripherals");
+    let cp = cortex_m::Peripherals::take().expect("cannot take core peripherals");
 
     info!("rcc");
 
@@ -44,16 +46,12 @@ fn main() -> ! {
     let pa0 = gpioa.pa0.into_analog();
 
     info!("Setup Adc1");
-    // let mut delay = cp.SYST.delay(&rcc.clocks);
-    let mut delay = DelayFromCountDownTimer::new(
-        Timer::new(dp.TIM6, &rcc.clocks).start_count_down(100u32.millis()),
-    );
-    let mut adc = dp
-        .ADC1
-        .claim(ClockSource::SystemClock, &rcc, &mut delay, true);
+    let mut delay = cp.SYST.delay(&rcc.clocks);
+    let mut adc12_common = dp.ADC12_COMMON.claim(Default::default(), &mut rcc);
+    let mut adc = adc12_common.claim(dp.ADC1, &mut delay);
 
-    adc.enable_temperature(&dp.ADC12_COMMON);
-    adc.enable_vref(&dp.ADC12_COMMON);
+    adc12_common.enable_temperature();
+    adc12_common.enable_vref();
     adc.set_auto_delay(true);
     adc.set_continuous(Continuous::Continuous);
     adc.reset_sequence();

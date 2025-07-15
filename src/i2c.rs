@@ -1,31 +1,27 @@
 //! I2C
+//<<<<<<< HEAD
 use embedded_hal::i2c::{ErrorKind, Operation, SevenBitAddress, TenBitAddress};
 use embedded_hal_old::blocking::i2c::{Read, Write, WriteRead};
 
-use crate::gpio::{gpioa::*, gpiob::*, gpioc::*, gpiof::*};
+use crate::stm32::i2c1;
+use crate::gpio::{self, OpenDrain};
+use crate::rcc::{Enable, GetBusFreq, Rcc, Reset};
+
 #[cfg(any(
-    feature = "stm32g471",
-    feature = "stm32g473",
-    feature = "stm32g474",
-    feature = "stm32g483",
-    feature = "stm32g484"
-))]
-use crate::gpio::{gpiog::*, AF3};
-use crate::gpio::{AlternateOD, AF2, AF4, AF8};
-use crate::rcc::{self, Rcc};
-#[cfg(any(
-    feature = "stm32g471",
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
     feature = "stm32g484"
 ))]
 use crate::stm32::I2C4;
-use crate::stm32::{I2C1, I2C2, I2C3, RCC};
+use crate::stm32::{I2C1, I2C2, I2C3};
 use crate::time::Hertz;
 use core::cmp;
+use core::convert::TryInto;
 
 /// I2C bus configuration.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Config {
     speed: Option<Hertz>,
     timing: Option<u32>,
@@ -35,12 +31,9 @@ pub struct Config {
 
 impl Config {
     /// Creates a default configuration for the given bus frequency.
-    pub fn new<T>(speed: T) -> Self
-    where
-        T: Into<Hertz>,
-    {
+    pub fn new(speed: Hertz) -> Self {
         Config {
-            speed: Some(speed.into()),
+            speed: Some(speed),
             timing: None,
             analog_filter: true,
             digital_filter: 0,
@@ -79,9 +72,13 @@ impl Config {
         self
     }
 
-    fn timing_bits(&self, i2c_clk: Hertz) -> u32 {
+    fn timing_bits(
+        self,
+        i2c_clk: Hertz,
+        reg: &mut stm32g4::raw::W<i2c1::timingr::TIMINGRrs>,
+    ) -> &mut stm32g4::raw::W<i2c1::timingr::TIMINGRrs> {
         if let Some(bits) = self.timing {
-            return bits;
+            return unsafe { reg.bits(bits) };
         }
         let speed = self.speed.unwrap();
         let (psc, scll, sclh, sdadel, scldel) = if speed.raw() <= 100_000 {
@@ -99,7 +96,18 @@ impl Config {
             let scldel = 3;
             (psc, scll, sclh, sdadel, scldel)
         };
-        psc << 28 | scldel << 20 | sdadel << 16 | sclh << 8 | scll
+
+        reg.presc().set(psc.try_into().unwrap());
+        reg.scldel().set(scldel);
+        reg.sdadel().set(sdadel);
+        reg.sclh().set(sclh.try_into().unwrap());
+        reg.scll().set(scll.try_into().unwrap())
+    }
+}
+
+impl From<Hertz> for Config {
+    fn from(value: Hertz) -> Self {
+        Self::new(value)
     }
 }
 
@@ -141,7 +149,13 @@ impl embedded_hal::i2c::Error for Error {
 }
 
 pub trait I2cExt<I2C> {
-    fn i2c<SDA, SCL>(self, sda: SDA, scl: SCL, config: Config, rcc: &mut Rcc) -> I2c<I2C, SDA, SCL>
+    fn i2c<SDA, SCL>(
+        self,
+        sda: SDA,
+        scl: SCL,
+        config: impl Into<Config>,
+        rcc: &mut Rcc,
+    ) -> I2c<I2C, SDA, SCL>
     where
         SDA: SDAPin<I2C>,
         SCL: SCLPin<I2C>;
@@ -151,13 +165,15 @@ pub trait I2cExt<I2C> {
 macro_rules! flush_txdr {
     ($i2c:expr) => {
         // If a pending TXIS flag is set, write dummy data to TXDR
-        if $i2c.isr.read().txis().bit_is_set() {
-            $i2c.txdr.write(|w| w.txdata().bits(0));
+        if $i2c.isr().read().txis().bit_is_set() {
+            unsafe {
+                $i2c.txdr().write(|w| w.txdata().bits(0));
+            }
         }
 
         // If TXDR is not flagged as empty, write 1 to flush it
-        if $i2c.isr.read().txe().bit_is_set() {
-            $i2c.isr.write(|w| w.txe().set_bit());
+        if $i2c.isr().read().txe().bit_is_set() {
+            $i2c.isr().write(|w| w.txe().set_bit());
         }
     };
 }
@@ -165,18 +181,18 @@ macro_rules! flush_txdr {
 macro_rules! busy_wait {
     ($i2c:expr, $flag:ident, $variant:ident) => {
         loop {
-            let isr = $i2c.isr.read();
+            let isr = $i2c.isr().read();
 
             if isr.$flag().$variant() {
                 break;
             } else if isr.berr().bit_is_set() {
-                $i2c.icr.write(|w| w.berrcf().set_bit());
+                $i2c.icr().write(|w| w.berrcf().clear());
                 return Err(Error::BusError);
             } else if isr.arlo().bit_is_set() {
-                $i2c.icr.write(|w| w.arlocf().set_bit());
+                $i2c.icr().write(|w| w.arlocf().clear());
                 return Err(Error::ArbitrationLost);
             } else if isr.nackf().bit_is_set() {
-                $i2c.icr.write(|w| w.stopcf().set_bit().nackcf().set_bit());
+                $i2c.icr().write(|w| w.stopcf().clear().nackcf().clear());
                 flush_txdr!($i2c);
                 return Err(Error::Nack);
             } else {
@@ -186,7 +202,7 @@ macro_rules! busy_wait {
     };
 }
 
-pub trait Instance: crate::Sealed + rcc::Enable + rcc::Reset + rcc::GetBusFreq {
+pub trait Instance: crate::Sealed + Enable + Reset + GetBusFreq {
     const PTR: *const crate::stm32::i2c1::RegisterBlock;
     fn registers(&self) -> &crate::stm32::i2c1::RegisterBlock {
         unsafe { &*Self::PTR }
@@ -195,17 +211,17 @@ pub trait Instance: crate::Sealed + rcc::Enable + rcc::Reset + rcc::GetBusFreq {
 
 macro_rules! i2c {
     ($I2CX:ident, $i2cx:ident,
-        sda: [ $($( #[ $pmetasda:meta ] )* $PSDA:ty,)+ ],
-        scl: [ $($( #[ $pmetascl:meta ] )* $PSCL:ty,)+ ],
+        sda: [ $($( #[ $pmetasda:meta ] )* $PSDA:ident<$AFDA:ident>,)+ ],
+        scl: [ $($( #[ $pmetascl:meta ] )* $PSCL:ident<$AFCL:ident>,)+ ],
     ) => {
         $(
             $( #[ $pmetasda ] )*
-            impl SDAPin<$I2CX> for $PSDA {}
+            impl SDAPin<$I2CX> for gpio::$PSDA<gpio::$AFDA<OpenDrain>> {}
         )+
 
         $(
             $( #[ $pmetascl ] )*
-            impl SCLPin<$I2CX> for $PSCL {}
+            impl SCLPin<$I2CX> for gpio::$PSCL<gpio::$AFCL<OpenDrain>> {}
         )+
 
         impl Instance for $I2CX {
@@ -215,12 +231,12 @@ macro_rules! i2c {
 }
 
 impl<I2C: Instance> I2cExt<I2C> for I2C {
-    fn i2c<SDA, SCL>(self, sda: SDA, scl: SCL, config: Config, rcc: &mut Rcc) -> I2c<I2C, SDA, SCL>
+    fn i2c<SDA, SCL>(self, sda: SDA, scl: SCL, config: impl Into<Config>, rcc: &mut Rcc) -> I2c<I2C, SDA, SCL>
     where
         SDA: SDAPin<I2C>,
         SCL: SCLPin<I2C>,
     {
-        I2c::i2c(self, sda, scl, config, rcc)
+        I2c::i2c(self, sda, scl, config.into(), rcc)
     }
 }
 
@@ -237,27 +253,23 @@ where
         SCL: SCLPin<I2C>,
     {
         // Enable and reset I2C
-        unsafe {
-            let rcc_ptr = &(*RCC::ptr());
-            I2C::enable(rcc_ptr);
-            I2C::reset(rcc_ptr);
-        }
+        I2C::enable(rcc);
+        I2C::reset(rcc);
 
         // Make sure the I2C unit is disabled so we can configure it
-        i2c.registers().cr1.modify(|_, w| w.pe().clear_bit());
+        i2c.registers().cr1().modify(|_, w| w.pe().clear_bit());
 
         // Setup protocol timings
-        let timing_bits = config.timing_bits(I2C::get_frequency(&rcc.clocks));
-        i2c.registers()
-            .timingr
-            .write(|w| unsafe { w.bits(timing_bits) });
+        i2c.registers().timingr().write(|w|
+            config.timing_bits(I2C::get_frequency(&rcc.clocks), w)
+        );
 
         // Enable the I2C processing
-        i2c.registers().cr1.modify(|_, w| {
+        i2c.registers().cr1().modify(|_, w| {
             w.pe()
                 .set_bit()
                 .dnf()
-                .bits(config.digital_filter)
+                .set(config.digital_filter)
                 .anfoff()
                 .bit(!config.analog_filter)
         });
@@ -269,9 +281,8 @@ where
     pub fn release(self) -> (I2C, SDA, SCL) {
         // Disable I2C.
         unsafe {
-            let rcc_ptr = &(*RCC::ptr());
-            I2C::reset(rcc_ptr);
-            I2C::disable(rcc_ptr);
+            I2C::reset_unchecked();
+            I2C::disable_unchecked();
         }
 
         (self.i2c, self.sda, self.scl)
@@ -292,14 +303,14 @@ where
         // Process 255 bytes at a time
         for (i, buffer) in buffer.chunks_mut(0xFF).enumerate() {
             // Prepare to receive `bytes`
-            self.i2c.registers().cr2.modify(|_, w| {
+            self.i2c.registers().cr2().modify(|_, w| {
                 if i == 0 {
                     w.add10().bit(addr_10b);
-                    w.sadd().bits(addr);
+                    w.sadd().set(addr);
                     w.rd_wrn().read();
                     w.start().start();
                 }
-                w.nbytes().bits(buffer.len() as u8);
+                w.nbytes().set(buffer.len() as u8);
                 if i == end {
                     w.reload().completed().autoend().automatic()
                 } else {
@@ -310,7 +321,7 @@ where
             for byte in buffer {
                 // Wait until we have received something
                 busy_wait!(self.i2c.registers(), rxne, is_not_empty);
-                *byte = self.i2c.registers().rxdr.read().rxdata().bits();
+                *byte = self.i2c.registers().rxdr().read().rxdata().bits();
             }
 
             if i != end {
@@ -322,7 +333,8 @@ where
         // Wait until the last transmission is finished
         // auto stop is set
         busy_wait!(self.i2c.registers(), stopf, is_stop);
-        Ok(self.i2c.registers().icr.write(|w| w.stopcf().clear()))
+        self.i2c.registers().icr().write(|w| w.stopcf().clear());
+        Ok(())
     }
 
     fn write_inner(&mut self, mut addr: u16, addr_10b: bool, buffer: &[u8]) -> Result<(), Error> {
@@ -333,11 +345,11 @@ where
 
         if buffer.is_empty() {
             // 0 byte write
-            self.i2c.registers().cr2.modify(|_, w| {
+            self.i2c.registers().cr2().modify(|_, w| {
                 w.add10().bit(addr_10b);
-                w.sadd().bits(addr);
+                w.sadd().set(addr);
                 w.rd_wrn().write();
-                w.nbytes().bits(0);
+                w.nbytes().set(0);
                 w.reload().completed();
                 w.autoend().automatic();
                 w.start().start()
@@ -347,14 +359,14 @@ where
         // Process 255 bytes at a time
         for (i, buffer) in buffer.chunks(0xFF).enumerate() {
             // Prepare to receive `bytes`
-            self.i2c.registers().cr2.modify(|_, w| {
+            self.i2c.registers().cr2().modify(|_, w| {
                 if i == 0 {
                     w.add10().bit(addr_10b);
-                    w.sadd().bits(addr);
+                    w.sadd().set(addr);
                     w.rd_wrn().write();
                     w.start().start();
                 }
-                w.nbytes().bits(buffer.len() as u8);
+                w.nbytes().set(buffer.len() as u8);
                 if i == end {
                     w.reload().completed().autoend().automatic()
                 } else {
@@ -366,7 +378,7 @@ where
                 // Wait until we are allowed to send data
                 // (START has been ACKed or last byte went through)
                 busy_wait!(self.i2c.registers(), txis, is_empty);
-                self.i2c.registers().txdr.write(|w| w.txdata().bits(*byte));
+                self.i2c.registers().txdr().write(|w| w.txdata().set(*byte));
             }
 
             if i != end {
@@ -378,7 +390,8 @@ where
         // Wait until the last transmission is finished
         // auto stop is set
         busy_wait!(self.i2c.registers(), stopf, is_stop);
-        Ok(self.i2c.registers().icr.write(|w| w.stopcf().clear()))
+        self.i2c.registers().icr().write(|w| w.stopcf().clear());
+        Ok(())
     }
 }
 
@@ -401,7 +414,7 @@ where
         Ok(for op in operation {
             // Wait for any operation on the bus to finish
             // for example in the case of another bus master having claimed the bus
-            while self.i2c.registers().isr.read().busy().bit_is_set() {}
+            while self.i2c.registers().isr().read().busy().bit_is_set() {}
             match op {
                 Operation::Read(data) => self.read_inner(address as u16, false, data)?,
                 Operation::Write(data) => self.write_inner(address as u16, false, data)?,
@@ -423,7 +436,7 @@ where
         Ok(for op in operation {
             // Wait for any operation on the bus to finish
             // for example in the case of another bus master having claimed the bus
-            while self.i2c.registers().isr.read().busy().bit_is_set() {}
+            while self.i2c.registers().isr().read().busy().bit_is_set() {}
             match op {
                 Operation::Read(data) => self.read_inner(address, true, data)?,
                 Operation::Write(data) => self.write_inner(address, true, data)?,
@@ -479,14 +492,14 @@ i2c!(
     I2C1,
     i2c1,
     sda: [
-        PA14<AlternateOD<AF4>>,
-        PB7<AlternateOD<AF4>>,
-        PB9<AlternateOD<AF4>>,
+        PA14<AF4>,
+        PB7<AF4>,
+        PB9<AF4>,
     ],
     scl: [
-        PA13<AlternateOD<AF4>>,
-        PA15<AlternateOD<AF4>>,
-        PB8<AlternateOD<AF4>>,
+        PA13<AF4>,
+        PA15<AF4>,
+        PB8<AF4>,
     ],
 );
 
@@ -494,20 +507,19 @@ i2c!(
     I2C2,
     i2c2,
     sda: [
-        PA8<AlternateOD<AF4>>,
-        PF0<AlternateOD<AF4>>,
+        PA8<AF4>,
+        PF0<AF4>,
     ],
     scl: [
-        PA9<AlternateOD<AF4>>,
-        PC4<AlternateOD<AF4>>,
+        PA9<AF4>,
+        PC4<AF4>,
         #[cfg(any(
-            feature = "stm32g471",
             feature = "stm32g473",
             feature = "stm32g474",
             feature = "stm32g483",
             feature = "stm32g484"
         ))]
-        PF6<AlternateOD<AF4>>,
+        PF6<AF4>,
     ],
 );
 
@@ -515,50 +527,45 @@ i2c!(
     I2C3,
     i2c3,
     sda: [
-        PB5<AlternateOD<AF8>>,
-        PC11<AlternateOD<AF8>>,
-        PC9<AlternateOD<AF8>>,
+        PB5<AF8>,
+        PC11<AF8>,
+        PC9<AF8>,
         #[cfg(any(
-            feature = "stm32g471",
             feature = "stm32g473",
             feature = "stm32g474",
             feature = "stm32g483",
             feature = "stm32g484"
         ))]
-        PF4<AlternateOD<AF4>>,
+        PF4<AF4>,
         #[cfg(any(
-            feature = "stm32g471",
             feature = "stm32g473",
             feature = "stm32g474",
             feature = "stm32g483",
             feature = "stm32g484"
         ))]
-        PG8<AlternateOD<AF4>>,
+        PG8<AF4>,
     ],
     scl: [
-        PA8<AlternateOD<AF2>>,
-        PC8<AlternateOD<AF8>>,
+        PA8<AF2>,
+        PC8<AF8>,
         #[cfg(any(
-            feature = "stm32g471",
             feature = "stm32g473",
             feature = "stm32g474",
             feature = "stm32g483",
             feature = "stm32g484"
         ))]
-        PF3<AlternateOD<AF4>>,
+        PF3<AF4>,
         #[cfg(any(
-            feature = "stm32g471",
             feature = "stm32g473",
             feature = "stm32g474",
             feature = "stm32g483",
             feature = "stm32g484"
         ))]
-        PG7<AlternateOD<AF4>>,
+        PG7<AF4>,
     ],
 );
 
 #[cfg(any(
-    feature = "stm32g471",
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
@@ -568,15 +575,15 @@ i2c!(
     I2C4,
     i2c4,
     sda: [
-        PB7<AlternateOD<AF3>>,
-        PC7<AlternateOD<AF8>>,
-        PF15<AlternateOD<AF4>>,
-        PG4<AlternateOD<AF4>>,
+        PB7<AF3>,
+        PC7<AF8>,
+        PF15<AF4>,
+        PG4<AF4>,
     ],
     scl: [
-        PA13<AlternateOD<AF3>>,
-        PC6<AlternateOD<AF8>>,
-        PF14<AlternateOD<AF4>>,
-        PG3<AlternateOD<AF4>>,
+        PA13<AF3>,
+        PC6<AF8>,
+        PF14<AF4>,
+        PG3<AF4>,
     ],
 );

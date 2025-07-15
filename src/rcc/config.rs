@@ -46,6 +46,16 @@ pub enum PllSrc {
     HSE_BYPASS(Hertz),
 }
 
+impl PllSrc {
+    pub const fn frequency(self) -> Hertz {
+        match self {
+            PllSrc::HSI => Hertz::MHz(16),
+            PllSrc::HSE(f) => f,
+            PllSrc::HSE_BYPASS(f) => f,
+        }
+    }
+}
+
 /// Divider for the PLL clock input (M)
 /// This must be set based on the input clock to keep the PLL input frequency within the limits
 /// specified in the datasheet.
@@ -70,11 +80,11 @@ pub enum PllMDiv {
 }
 
 impl PllMDiv {
-    pub fn divisor(&self) -> u32 {
+    pub const fn divisor(&self) -> u32 {
         (*self as u32) + 1
     }
 
-    pub fn register_setting(&self) -> u8 {
+    pub const fn register_setting(&self) -> u8 {
         *self as u8
     }
 }
@@ -89,11 +99,11 @@ pub enum PllQDiv {
 }
 
 impl PllQDiv {
-    pub fn divisor(&self) -> u32 {
+    pub const fn divisor(&self) -> u32 {
         ((*self as u32) + 1) * 2
     }
 
-    pub fn register_setting(&self) -> u8 {
+    pub const fn register_setting(&self) -> u8 {
         *self as u8
     }
 }
@@ -108,11 +118,11 @@ pub enum PllRDiv {
 }
 
 impl PllRDiv {
-    pub fn divisor(&self) -> u32 {
+    pub const fn divisor(&self) -> u32 {
         ((*self as u32) + 1) * 2
     }
 
-    pub fn register_setting(&self) -> u8 {
+    pub const fn register_setting(&self) -> u8 {
         *self as u8
     }
 }
@@ -157,11 +167,11 @@ pub enum PllPDiv {
 }
 
 impl PllPDiv {
-    pub fn divisor(&self) -> u32 {
+    pub const fn divisor(&self) -> u32 {
         *self as u32
     }
 
-    pub fn register_setting(&self) -> u8 {
+    pub const fn register_setting(&self) -> u8 {
         *self as u8
     }
 }
@@ -292,11 +302,11 @@ pub enum PllNMul {
 }
 
 impl PllNMul {
-    pub fn multiplier(&self) -> u32 {
+    pub const fn multiplier(&self) -> u32 {
         *self as u32
     }
 
-    pub fn register_setting(&self) -> u8 {
+    pub const fn register_setting(&self) -> u8 {
         *self as u8
     }
 }
@@ -312,8 +322,8 @@ pub struct PllConfig {
     pub p: Option<PllPDiv>,
 }
 
-impl Default for PllConfig {
-    fn default() -> PllConfig {
+impl PllConfig {
+    pub const fn new() -> Self {
         PllConfig {
             mux: PllSrc::HSI,
             m: PllMDiv::DIV_2,
@@ -323,6 +333,24 @@ impl Default for PllConfig {
             p: None,
         }
     }
+}
+
+impl Default for PllConfig {
+    fn default() -> PllConfig {
+        Self::new()
+    }
+}
+
+/// FDCAN Clock Source
+#[allow(clippy::upper_case_acronyms)]
+pub enum FdCanClockSource {
+    /// Select HSE as the FDCAN clock source
+    HSE = 0b00,
+    /// Select PLL "Q" clock as the FDCAN clock source
+    PLLQ = 0b01,
+    /// Select "P" clock as the FDCAN clock source
+    PCLK = 0b10,
+    //Reserved = 0b10,
 }
 
 /// Clocks configutation
@@ -335,61 +363,77 @@ pub struct Config {
 
     /// Required for f_sys > 150MHz
     pub(crate) enable_boost: bool,
+
+    pub(crate) fdcansel: FdCanClockSource,
 }
 
 impl Config {
-    pub fn new(mux: SysClockSrc) -> Self {
-        Config::default().clock_src(mux)
+    pub const fn new(sys_mux: SysClockSrc) -> Self {
+        Config {
+            sys_mux,
+            pll_cfg: PllConfig::new(),
+            ahb_psc: Prescaler::NotDivided,
+            apb1_psc: Prescaler::NotDivided,
+            apb2_psc: Prescaler::NotDivided,
+            enable_boost: false,
+            fdcansel: FdCanClockSource::HSE,
+        }
     }
 
-    pub fn pll() -> Self {
-        Config::default().clock_src(SysClockSrc::PLL)
+    pub const fn const_default() -> Self {
+        Self::new(SysClockSrc::HSI)
     }
 
-    pub fn hsi() -> Self {
-        Config::default().clock_src(SysClockSrc::HSI)
+    pub const fn pll() -> Self {
+        Config::const_default().clock_src(SysClockSrc::PLL)
     }
 
-    pub fn clock_src(mut self, mux: SysClockSrc) -> Self {
+    pub const fn hsi() -> Self {
+        Config::const_default().clock_src(SysClockSrc::HSI)
+    }
+
+    pub const fn hse(freq: Hertz) -> Self {
+        Config::const_default().clock_src(SysClockSrc::HSE(freq))
+    }
+
+    pub const fn clock_src(mut self, mux: SysClockSrc) -> Self {
         self.sys_mux = mux;
         self
     }
 
-    pub fn pll_cfg(mut self, cfg: PllConfig) -> Self {
+    pub const fn pll_cfg(mut self, cfg: PllConfig) -> Self {
         self.pll_cfg = cfg;
         self
     }
 
-    pub fn ahb_psc(mut self, psc: Prescaler) -> Self {
+    pub const fn ahb_psc(mut self, psc: Prescaler) -> Self {
         self.ahb_psc = psc;
         self
     }
 
-    pub fn apb1_psc(mut self, psc: Prescaler) -> Self {
+    pub const fn apb1_psc(mut self, psc: Prescaler) -> Self {
         self.apb1_psc = psc;
         self
     }
 
-    pub fn apb2_psc(mut self, psc: Prescaler) -> Self {
+    pub const fn apb2_psc(mut self, psc: Prescaler) -> Self {
         self.apb2_psc = psc;
         self
     }
 
-    pub fn boost(mut self, enable_boost: bool) -> Self {
+    pub const fn boost(mut self, enable_boost: bool) -> Self {
         self.enable_boost = enable_boost;
+        self
+    }
+
+    pub const fn fdcan_src(mut self, mux: FdCanClockSource) -> Self {
+        self.fdcansel = mux;
         self
     }
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config {
-            sys_mux: SysClockSrc::HSI,
-            pll_cfg: PllConfig::default(),
-            ahb_psc: Prescaler::NotDivided,
-            apb1_psc: Prescaler::NotDivided,
-            apb2_psc: Prescaler::NotDivided,
-            enable_boost: false,
-        }
+        Config::const_default()
     }
 }

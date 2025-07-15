@@ -2,26 +2,12 @@
 //!
 
 use crate::rcc::{self, Rcc};
-use fdcan;
 
 mod sealed {
     /// A TX pin configured for CAN communication
     pub trait Tx<CAN> {}
     /// An RX pin configured for CAN communication
     pub trait Rx<CAN> {}
-}
-
-/// Select an FDCAN Clock Source
-#[allow(clippy::upper_case_acronyms)]
-#[allow(dead_code)]
-enum FdCanClockSource {
-    /// Select HSE as the FDCAN clock source
-    HSE = 0b00,
-    /// Select PLL "Q" clock as the FDCAN clock source
-    PLLQ = 0b01,
-    /// Select "P" clock as the FDCAN clock source
-    PCLK = 0b10,
-    //Reserved = 0b10,
 }
 
 /// Storage type for the CAN controller
@@ -47,25 +33,13 @@ where
         self,
         _tx: TX,
         _rx: RX,
-        rcc: &Rcc,
+        rcc: &mut Rcc,
     ) -> fdcan::FdCan<Can<Self>, fdcan::ConfigMode>
     where
         TX: sealed::Tx<Self>,
         RX: sealed::Rx<Self>,
     {
-        Self::enable(&rcc.rb);
-
-        if rcc.rb.ccipr.read().fdcansel().is_hse() {
-            // Select P clock as FDCAN clock source
-            rcc.rb.ccipr.modify(|_, w| {
-                // This is sound, as `FdCanClockSource` only contains valid values for this field.
-                unsafe {
-                    w.fdcansel().bits(FdCanClockSource::PCLK as u8);
-                }
-
-                w
-            });
-        }
+        Self::enable(rcc);
 
         self.fdcan_unchecked()
     }
@@ -79,11 +53,11 @@ macro_rules! pins {
          rx: [ $($( #[ $pmetarx:meta ] )* $rx:ident<$rxaf:ident>),+ $(,)? ])) => {
         $(
             $( #[ $pmetatx ] )*
-            impl sealed::Tx<$PER> for $tx<crate::gpio::Alternate<$txaf>> {}
+            impl sealed::Tx<$PER> for $tx<$txaf> {}
         )+
         $(
             $( #[ $pmetarx ] )*
-            impl sealed::Rx<$PER> for $rx<crate::gpio::Alternate<$rxaf>> {}
+            impl sealed::Rx<$PER> for $rx<$rxaf> {}
         )+
     };
 }
@@ -91,12 +65,7 @@ macro_rules! pins {
 mod fdcan1 {
     use super::sealed;
     use super::{Can, CanExt};
-    use crate::gpio::{
-        gpioa::{PA11, PA12},
-        gpiob::{PB8, PB9},
-        gpiod::{PD0, PD1},
-        AF9,
-    };
+    use crate::gpio::{AF9, PA11, PA12, PB8, PB9, PD0, PD1};
     use crate::stm32::FDCAN1;
     use fdcan;
 
@@ -135,7 +104,6 @@ mod fdcan1 {
 }
 
 #[cfg(any(
-    feature = "stm32g471",
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
@@ -146,10 +114,7 @@ mod fdcan1 {
 mod fdcan2 {
     use super::sealed;
     use super::{Can, CanExt};
-    use crate::gpio::{
-        gpiob::{PB12, PB13, PB5, PB6},
-        AF9,
-    };
+    use crate::gpio::{AF9, PB12, PB13, PB5, PB6};
     use crate::stm32::FDCAN2;
     use fdcan;
     use fdcan::message_ram;
@@ -193,11 +158,7 @@ mod fdcan2 {
 mod fdcan3 {
     use super::sealed;
     use super::{Can, CanExt};
-    use crate::gpio::{
-        gpioa::{PA15, PA8},
-        gpiob::{PB3, PB4},
-        AF11,
-    };
+    use crate::gpio::{AF11, PA15, PA8, PB3, PB4};
     use crate::stm32::FDCAN3;
     use fdcan;
     use fdcan::message_ram;

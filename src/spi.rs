@@ -1,26 +1,18 @@
 use crate::dma::mux::DmaMuxResources;
 use crate::dma::traits::TargetAddress;
 use crate::dma::MemoryToPeripheral;
-use crate::gpio::{gpioa::*, gpiob::*, gpioc::*, gpiof::*, Alternate, AF5, AF6};
+
+use crate::gpio;
+use crate::rcc::{Enable, GetBusFreq, Rcc, Reset};
 #[cfg(any(
-    feature = "stm32g471",
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
     feature = "stm32g484"
 ))]
-use crate::gpio::{gpioe::*, gpiog::*};
-use crate::rcc::{self, Rcc};
-#[cfg(any(
-    feature = "stm32g471",
-    feature = "stm32g473",
-    feature = "stm32g474",
-    feature = "stm32g483",
-    feature = "stm32g484"
-))]
-use crate::stm32::{RCC, SPI1, SPI2, SPI3, SPI4, spi1};
+use crate::stm32::SPI4;
+use crate::stm32::{spi1, SPI1, SPI2, SPI3};
 use crate::time::Hertz;
-use core::cell::UnsafeCell;
 use core::ptr;
 
 use embedded_hal::spi::ErrorKind;
@@ -97,24 +89,29 @@ impl FrameSize for u16 {
 
 pub trait Instance:
     crate::Sealed
-    // everything derefs to spi4, except spi1
-    // + Deref<Target = crate::stm32::spi1::RegisterBlock>
-    + rcc::Enable
-    + rcc::Reset
-    + rcc::GetBusFreq
+    + Enable
+    + Reset
+    + GetBusFreq
 {
-    const PTR: *const spi1::RegisterBlock;
+    const PTR: &spi1::RegisterBlock;
     #[inline]
     fn registers(&self) -> &spi1::RegisterBlock {
-        unsafe { &*Self::PTR }
+        Self::PTR
     }
+}
+
+impl<const A: usize> Instance for crate::Periph<spi1::RegisterBlock, A>
+    where 
+    crate::Periph<spi1::RegisterBlock, A>: Enable + Reset + GetBusFreq
+{
+    const PTR: &spi1::RegisterBlock = unsafe { &*(A as *const _) };
 }
 
 macro_rules! spi {
     ($SPIX:ident, $spiX:ident,
-        sck: [ $($( #[ $pmetasck:meta ] )* $SCK:ty,)+ ],
-        miso: [ $($( #[ $pmetamiso:meta ] )* $MISO:ty,)+ ],
-        mosi: [ $($( #[ $pmetamosi:meta ] )* $MOSI:ty,)+ ],
+        sck: [ $($( #[ $pmetasck:meta ] )* $SCK:ident<$ASCK:ident>,)+ ],
+        miso: [ $($( #[ $pmetamiso:meta ] )* $MISO:ident<$AMISO:ident>,)+ ],
+        mosi: [ $($( #[ $pmetamosi:meta ] )* $MOSI:ident<$AMOSI:ident>,)+ ],
         $mux:expr,
     ) => {
         impl PinSck<$SPIX> for NoSck {}
@@ -123,26 +120,26 @@ macro_rules! spi {
 
         $(
             $( #[ $pmetasck ] )*
-            impl PinSck<$SPIX> for $SCK {}
+            impl PinSck<$SPIX> for gpio::$SCK<gpio::$ASCK> {}
         )*
         $(
             $( #[ $pmetamiso ] )*
-            impl PinMiso<$SPIX> for $MISO {}
+            impl PinMiso<$SPIX> for gpio::$MISO<gpio::$AMISO> {}
         )*
         $(
             $( #[ $pmetamosi ] )*
-            impl PinMosi<$SPIX> for $MOSI {}
+            impl PinMosi<$SPIX> for gpio::$MOSI<gpio::$AMOSI> {}
         )*
 
-        impl Instance for $SPIX {
-            const PTR: *const crate::stm32::spi1::RegisterBlock = $SPIX::PTR as *const crate::stm32::spi1::RegisterBlock;
-        }
+        //impl Instance for $SPIX {
+        //    const PTR: *const crate::stm32::spi1::RegisterBlock = $SPIX::PTR as *const crate::stm32::spi1::RegisterBlock;
+        //}
 
         unsafe impl<PINS> TargetAddress<MemoryToPeripheral> for Spi<$SPIX, PINS> {
             #[inline(always)]
             fn address(&self) -> u32 {
                 // unsafe: only the Tx part accesses the Tx register
-                &unsafe { &*<$SPIX>::ptr() }.dr as *const _ as u32
+                unsafe { &*<$SPIX>::ptr() }.dr() as *const _ as u32
             }
             type MemSize = u8;
             const REQUEST_LINE: Option<u8> = Some($mux as u8);
@@ -158,7 +155,7 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
     pub fn enable_tx_dma(self) -> Spi<SPI, PINS> {
         self.spi
             .registers()
-            .cr2
+            .cr2()
             .modify(|_, w| w.txdmaen().set_bit());
         Spi {
             spi: self.spi,
@@ -168,7 +165,7 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
 
     #[inline]
     fn nb_read<W: FrameSize>(&mut self) -> nb::Result<W, Error> {
-        let sr = self.spi.registers().sr.read();
+        let sr = self.spi.registers().sr().read();
         Err(if sr.ovr().bit_is_set() {
             nb::Error::Other(Error::Overrun)
         } else if sr.modf().bit_is_set() {
@@ -183,7 +180,7 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
     }
     #[inline]
     fn nb_write<W: FrameSize>(&mut self, word: W) -> nb::Result<(), Error> {
-        let sr = self.spi.registers().sr.read();
+        let sr = self.spi.registers().sr().read();
         Err(if sr.ovr().bit_is_set() {
             nb::Error::Other(Error::Overrun)
         } else if sr.modf().bit_is_set() {
@@ -199,7 +196,7 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
     }
     #[inline]
     fn nb_read_no_err<W: FrameSize>(&mut self) -> nb::Result<W, core::convert::Infallible> {
-        if self.spi.registers().sr.read().rxne().bit_is_set() {
+        if self.spi.registers().sr().read().rxne().bit_is_set() {
             Ok(self.read_unchecked())
         } else {
             Err(nb::Error::WouldBlock)
@@ -209,30 +206,30 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
     fn read_unchecked<W: FrameSize>(&mut self) -> W {
         // NOTE(read_volatile) read only 1 byte (the svd2rust API only allows
         // reading a half-word)
-        unsafe { ptr::read_volatile(&self.spi.registers().dr as *const _ as *const W) }
+        unsafe { ptr::read_volatile(&self.spi.registers().dr() as *const _ as *const W) }
     }
     #[inline]
     fn write_unchecked<W: FrameSize>(&mut self, word: W) {
-        let dr = &self.spi.registers().dr as *const _ as *const UnsafeCell<W>;
         // NOTE(write_volatile) see note above
-        unsafe { ptr::write_volatile(UnsafeCell::raw_get(dr), word) };
+        let dr = self.spi.registers().dr().as_ptr() as *mut W;
+        unsafe { ptr::write_volatile(dr, word) };
     }
     #[inline]
     pub fn set_tx_only(&mut self) {
         self.spi
             .registers()
-            .cr1
+            .cr1()
             .modify(|_, w| w.bidimode().set_bit().bidioe().set_bit());
     }
     #[inline]
     pub fn set_bidi(&mut self) {
         self.spi
             .registers()
-            .cr1
+            .cr1()
             .modify(|_, w| w.bidimode().clear_bit().bidioe().clear_bit());
     }
     fn tx_fifo_cap(&self) -> u8 {
-        match self.spi.registers().sr.read().ftlvl().bits() {
+        match self.spi.registers().sr().read().ftlvl().bits() {
             0 => 4,
             1 => 3,
             2 => 2,
@@ -242,7 +239,7 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
     fn flush_inner(&mut self) -> Result<(), Error> {
         // stop receiving data
         self.set_tx_only();
-        self.spi.registers().cr2.modify(|_, w| w.frxth().set_bit());
+        self.spi.registers().cr2().modify(|_, w| w.frxth().set_bit());
         // drain rx fifo
         while match self.nb_read::<u8>() {
             Ok(_) => true,
@@ -252,7 +249,7 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
             core::hint::spin_loop()
         }
         // wait for idle
-        Ok(while self.spi.registers().sr.read().bsy().bit() {
+        Ok(while self.spi.registers().sr().read().bsy().bit() {
             core::hint::spin_loop()
         })
     }
@@ -260,7 +257,7 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
 
 fn setup_spi_regs(regs: &spi1::RegisterBlock, spi_freq: u32, bus_freq: u32, mode: Mode) {
     // disable SS output
-    regs.cr2.write(|w| w.ssoe().clear_bit());
+    regs.cr2().write(|w| w.ssoe().clear_bit());
 
     let br = match bus_freq / spi_freq {
         0 => unreachable!(),
@@ -274,10 +271,10 @@ fn setup_spi_regs(regs: &spi1::RegisterBlock, spi_freq: u32, bus_freq: u32, mode
         _ => 0b111,
     };
 
-    regs.cr2
+    regs.cr2()
         .write(|w| unsafe { w.frxth().set_bit().ds().bits(0b111).ssoe().clear_bit() });
 
-    regs.cr1.write(|w| unsafe {
+    regs.cr1().write(|w| unsafe {
         w.cpha()
             .bit(mode.phase == Phase::CaptureOnSecondTransition)
             .cpol()
@@ -294,8 +291,6 @@ fn setup_spi_regs(regs: &spi1::RegisterBlock, spi_freq: u32, bus_freq: u32, mode
             .set_bit()
             .rxonly()
             .clear_bit()
-            .dff()
-            .clear_bit()
             .bidimode()
             .clear_bit()
             .ssi()
@@ -311,12 +306,8 @@ impl<SPI: Instance> SpiExt<SPI> for SPI {
         PINS: Pins<SPI>,
         T: Into<Hertz>,
     {
-        //Spi::$spiX(self, pins, mode, freq, rcc)
-        unsafe {
-            let rcc_ptr = &(*RCC::ptr());
-            Self::enable(rcc_ptr);
-            Self::reset(rcc_ptr);
-        }
+        Self::enable(rcc);
+        Self::reset(rcc);
 
         let spi_freq = freq.into().raw();
         let bus_freq = SPI::get_frequency(&rcc.clocks).raw();
@@ -342,7 +333,7 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
         // FIFO threshold to 16 bits
         self.spi
             .registers()
-            .cr2
+            .cr2()
             .modify(|_, w| w.frxth().clear_bit());
         self.set_bidi();
 
@@ -366,7 +357,7 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
 
         let odd_idx = len.saturating_sub(2 * prefill + pair_left);
         // FIFO threshold to 8 bits
-        self.spi.registers().cr2.modify(|_, w| w.frxth().set_bit());
+        self.spi.registers().cr2().modify(|_, w| w.frxth().set_bit());
         if pair_left == 1 {
             nb::block!(self.nb_write(0u8))?;
             words[odd_idx] = nb::block!(self.nb_read_no_err()).unwrap();
@@ -407,7 +398,7 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
         // FIFO threshold to 16 bits
         self.spi
             .registers()
-            .cr2
+            .cr2()
             .modify(|_, w| w.frxth().clear_bit());
 
         // same prefill as in read, this time with actual data
@@ -431,7 +422,7 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
         }
 
         // FIFO threshold to 8 bits
-        self.spi.registers().cr2.modify(|_, w| w.frxth().set_bit());
+        self.spi.registers().cr2().modify(|_, w| w.frxth().set_bit());
 
         if pair_left == 1 {
             let write_idx = common_len - 1;
@@ -466,7 +457,7 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
         self.set_bidi();
         self.spi
             .registers()
-            .cr2
+            .cr2()
             .modify(|_, w| w.frxth().clear_bit());
         let half_len = len / 2;
         let pair_left = len % 2;
@@ -488,7 +479,7 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
             let write = u16::from_le_bytes(words_alias[i + prefill]);
             nb::block!(self.nb_write(write))?;
         }
-        self.spi.registers().cr2.modify(|_, w| w.frxth().set_bit());
+        self.spi.registers().cr2().modify(|_, w| w.frxth().set_bit());
 
         if pair_left == 1 {
             let read_idx = len - 2 * prefill - 1;
@@ -521,7 +512,7 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u16> for Spi<SPI,
         // FIFO threshold to 16 bits
         self.spi
             .registers()
-            .cr2
+            .cr2()
             .modify(|_, w| w.frxth().clear_bit());
         self.set_bidi();
         // prefill write fifo so that the clock doen't stop while fetch the read byte
@@ -555,7 +546,7 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u16> for Spi<SPI,
         // FIFO threshold to 16 bits
         self.spi
             .registers()
-            .cr2
+            .cr2()
             .modify(|_, w| w.frxth().clear_bit());
         self.set_bidi();
         let common_len = core::cmp::min(read.len(), write.len());
@@ -593,7 +584,7 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u16> for Spi<SPI,
         self.set_bidi();
         self.spi
             .registers()
-            .cr2
+            .cr2()
             .modify(|_, w| w.frxth().clear_bit());
         let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, len);
 
@@ -642,40 +633,37 @@ spi!(
     SPI1,
     spi1,
     sck: [
-        PA5<Alternate<AF5>>,
-        PB3<Alternate<AF5>>,
+        PA5<AF5>,
+        PB3<AF5>,
         #[cfg(any(
-            feature = "stm32g471",
             feature = "stm32g473",
             feature = "stm32g474",
             feature = "stm32g483",
             feature = "stm32g484"
         ))]
-        PG2<Alternate<AF5>>,
+        PG2<AF5>,
     ],
     miso: [
-        PA6<Alternate<AF5>>,
-        PB4<Alternate<AF5>>,
+        PA6<AF5>,
+        PB4<AF5>,
         #[cfg(any(
-            feature = "stm32g471",
             feature = "stm32g473",
             feature = "stm32g474",
             feature = "stm32g483",
             feature = "stm32g484"
         ))]
-        PG3<Alternate<AF5>>,
+        PG3<AF5>,
     ],
     mosi: [
-        PA7<Alternate<AF5>>,
-        PB5<Alternate<AF5>>,
+        PA7<AF5>,
+        PB5<AF5>,
         #[cfg(any(
-            feature = "stm32g471",
             feature = "stm32g473",
             feature = "stm32g474",
             feature = "stm32g483",
             feature = "stm32g484"
         ))]
-        PG4<Alternate<AF5>>,
+        PG4<AF5>,
     ],
     DmaMuxResources::SPI1_TX,
 );
@@ -684,18 +672,18 @@ spi!(
     SPI2,
     spi2,
     sck: [
-        PF1<Alternate<AF5>>,
-        PF9<Alternate<AF5>>,
-        PF10<Alternate<AF5>>,
-        PB13<Alternate<AF5>>,
+        PF1<AF5>,
+        PF9<AF5>,
+        PF10<AF5>,
+        PB13<AF5>,
     ],
     miso: [
-        PA10<Alternate<AF5>>,
-        PB14<Alternate<AF5>>,
+        PA10<AF5>,
+        PB14<AF5>,
     ],
     mosi: [
-        PA11<Alternate<AF5>>,
-        PB15<Alternate<AF5>>,
+        PA11<AF5>,
+        PB15<AF5>,
     ],
     DmaMuxResources::SPI2_TX,
 );
@@ -704,30 +692,28 @@ spi!(
     SPI3,
     spi3,
     sck: [
-        PB3<Alternate<AF6>>,
-        PC10<Alternate<AF6>>,
+        PB3<AF6>,
+        PC10<AF6>,
         #[cfg(any(
-            feature = "stm32g471",
             feature = "stm32g473",
             feature = "stm32g474",
             feature = "stm32g483",
             feature = "stm32g484"
         ))]
-        PG9<Alternate<AF6>>,
+        PG9<AF6>,
     ],
     miso: [
-        PB4<Alternate<AF6>>,
-        PC11<Alternate<AF6>>,
+        PB4<AF6>,
+        PC11<AF6>,
     ],
     mosi: [
-        PB5<Alternate<AF6>>,
-        PC12<Alternate<AF6>>,
+        PB5<AF6>,
+        PC12<AF6>,
     ],
     DmaMuxResources::SPI3_TX,
 );
 
 #[cfg(any(
-    feature = "stm32g471",
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
@@ -737,16 +723,16 @@ spi!(
     SPI4,
     spi4,
     sck: [
-        PE2<Alternate<AF5>>,
-        PE12<Alternate<AF5>>,
+        PE2<AF5>,
+        PE12<AF5>,
     ],
     miso: [
-        PE5<Alternate<AF5>>,
-        PE13<Alternate<AF5>>,
+        PE5<AF5>,
+        PE13<AF5>,
     ],
     mosi: [
-        PE6<Alternate<AF5>>,
-        PE14<Alternate<AF5>>,
+        PE6<AF5>,
+        PE14<AF5>,
     ],
     DmaMuxResources::SPI4_TX,
 );

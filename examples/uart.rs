@@ -2,6 +2,7 @@
 #![deny(unsafe_code)]
 #![no_main]
 #![no_std]
+#![allow(clippy::uninlined_format_args)]
 
 use embedded_io::{Read, Write};
 use hal::prelude::*;
@@ -11,7 +12,6 @@ use hal::{rcc, stm32};
 use stm32g4xx_hal as hal;
 
 use cortex_m_rt::entry;
-use nb::block;
 use utils::logger::info;
 
 #[macro_use]
@@ -57,10 +57,11 @@ fn main() -> ! {
     usart.read_exact(&mut read_buf).unwrap();
     usart.write_all(&read_buf).unwrap();
 
+    let mut single_byte_buffer = [0; 1];
     let mut cnt = 0;
     loop {
-        match block!(embedded_hal_old::serial::Read::read(&mut usart)) {
-            Ok(byte) => writeln!(usart, "{}: {}\r", cnt, byte).unwrap(),
+        match usart.read_exact(&mut single_byte_buffer) {
+            Ok(()) => writeln!(usart, "{}: {}\r", cnt, single_byte_buffer[0]).unwrap(),
             Err(e) => writeln!(usart, "E: {:?}\r", e).unwrap(),
         };
         cnt += 1;

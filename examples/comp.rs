@@ -13,19 +13,10 @@ extern crate cortex_m_rt as rt;
 
 use rt::entry;
 
-#[cfg(not(feature = "stm32g474"))]
 #[entry]
 fn main() -> ! {
-    #[allow(clippy::empty_loop)]
-    loop {} // TODO: add support for more devices
-}
-
-#[cfg(feature = "stm32g474")]
-#[entry]
-fn main() -> ! {
-    use hal::comparator::{ComparatorExt, ComparatorSplit, Config, Hysteresis, RefintInput};
+    use hal::comparator::{refint_input, ComparatorExt, ComparatorSplit, Config, Hysteresis};
     use hal::gpio::GpioExt;
-    use hal::prelude::OutputPin;
     use hal::rcc::RccExt;
     use hal::stm32;
     use stm32g4xx_hal as hal;
@@ -39,7 +30,7 @@ fn main() -> ! {
 
     let pa1 = gpioa.pa1.into_analog();
     let pa0 = gpioa.pa0.into_analog();
-    let comp1 = comp1.comparator(&pa1, pa0, Config::default(), &rcc.clocks);
+    let comp1 = comp1.comparator(pa1, pa0, Config::default(), &rcc.clocks);
     let comp1 = comp1.enable();
 
     // led1 pa1 will be updated manually when to match comp1 value
@@ -47,8 +38,8 @@ fn main() -> ! {
 
     let pa7 = gpioa.pa7.into_analog();
     let comp2 = comp2.comparator(
-        &pa7,
-        RefintInput::VRefintM12,
+        pa7,
+        refint_input::VRefintM12,
         Config::default()
             .hysteresis(Hysteresis::None)
             .output_inverted(),
@@ -63,8 +54,8 @@ fn main() -> ! {
     loop {
         // Read comp1 output and update led1 accordingly
         match comp1.output() {
-            true => led1.set_high().unwrap(),
-            false => led1.set_low().unwrap(),
+            true => led1.set_high(),
+            false => led1.set_low(),
         }
     }
 }

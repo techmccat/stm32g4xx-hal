@@ -1,17 +1,15 @@
 #![no_main]
 #![no_std]
+#![allow(clippy::uninlined_format_args)]
 
 use crate::hal::{
     adc::{config::SampleTime, AdcClaim},
-    time::ExtU32,
-    timer::Timer,
-    delay::DelayFromCountDownTimer,
     pwr::PwrExt,
     rcc::Config,
     stm32::Peripherals,
 };
 use hal::prelude::*;
-use stm32g4xx_hal as hal;
+use stm32g4xx_hal::{self as hal, adc::AdcCommonExt};
 
 use cortex_m_rt::entry;
 
@@ -26,7 +24,7 @@ fn main() -> ! {
     info!("start");
 
     let dp = Peripherals::take().unwrap();
-    // let cp = cortex_m::Peripherals::take().expect("cannot take core peripherals");
+    let cp = cortex_m::Peripherals::take().expect("cannot take core peripherals");
 
     info!("rcc");
 
@@ -35,16 +33,12 @@ fn main() -> ! {
     let mut rcc = rcc.freeze(Config::hsi(), pwr);
 
     info!("Setup Adc1");
-    // let mut delay = cp.SYST.delay(&rcc.clocks);
-    let mut delay = DelayFromCountDownTimer::new(
-        Timer::new(dp.TIM6, &rcc.clocks).start_count_down(100u32.millis()),
-    );
-    let mut adc = dp.ADC2.claim_and_configure(
-        stm32g4xx_hal::adc::ClockSource::SystemClock,
-        &rcc,
+    let mut delay = cp.SYST.delay(&rcc.clocks);
+    let adc12_common = dp.ADC12_COMMON.claim(Default::default(), &mut rcc);
+    let mut adc = adc12_common.claim_and_configure(
+        dp.ADC2,
         stm32g4xx_hal::adc::config::AdcConfig::default(),
         &mut delay,
-        false,
     );
 
     info!("Setup Gpio");

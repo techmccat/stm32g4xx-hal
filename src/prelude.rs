@@ -1,10 +1,4 @@
-pub use embedded_hal::{
-    delay::DelayNs,
-    digital::{InputPin, OutputPin, StatefulOutputPin},
-    i2c::I2c,
-    pwm::SetDutyCycle,
-    spi::SpiBus,
-};
+pub use embedded_hal::{delay::DelayNs, i2c::I2c, pwm::SetDutyCycle, spi::SpiBus};
 
 pub use embedded_hal_old::{
     adc::OneShot as _,
@@ -30,7 +24,9 @@ pub use crate::delay::SYSTDelayExt as _;
 pub use crate::exti::ExtiExt as _;
 pub use crate::gpio::GpioExt as _;
 pub use crate::i2c::I2cExt as _;
-pub use crate::opamp::prelude::*;
+pub use crate::opamp::IntoFollower as _;
+pub use crate::opamp::IntoOpenLoop as _;
+pub use crate::opamp::IntoPga as _;
 pub use crate::opamp::OpampEx as _;
 pub use crate::rcc::LSCOExt as _;
 pub use crate::rcc::MCOExt as _;
@@ -47,3 +43,4 @@ pub use crate::pwm::PwmExt as _;
 // pub use crate::timer::TimerExt as _;
 // pub use crate::watchdog::IWDGExt as _;
 // pub use crate::watchdog::WWDGExt as _;
+pub use crate::pwr::PwrExt as _;

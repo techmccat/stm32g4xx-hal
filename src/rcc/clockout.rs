@@ -1,26 +1,26 @@
 use crate::gpio::*;
+use crate::pac::RCC;
 use crate::rcc::*;
-use crate::stm32::RCC;
 
-pub type LscoPin = gpioa::PA2<DefaultMode>;
+pub type LscoPin = gpioa::PA2<Analog>;
 
 pub struct Lsco {
-    pin: gpioa::PA2<Alternate<AF0>>,
+    pin: gpioa::PA2<AF0>,
 }
 
 impl Lsco {
     pub fn enable(&self) {
         let rcc = unsafe { &(*RCC::ptr()) };
-        rcc.bdcr.modify(|_, w| w.lscoen().set_bit());
+        rcc.bdcr().modify(|_, w| w.lscoen().set_bit());
     }
 
     pub fn disable(&self) {
         let rcc = unsafe { &(*RCC::ptr()) };
-        rcc.bdcr.modify(|_, w| w.lscoen().clear_bit());
+        rcc.bdcr().modify(|_, w| w.lscoen().clear_bit());
     }
 
     pub fn release(self) -> LscoPin {
-        self.pin.into_floating_input()
+        self.pin.into_analog()
     }
 }
 
@@ -41,9 +41,9 @@ impl LSCOExt for LscoPin {
                 false
             }
         };
-        rcc.rb.bdcr.modify(|_, w| w.lscosel().bit(src_select_bit));
+        rcc.rb.bdcr().modify(|_, w| w.lscosel().bit(src_select_bit));
         Lsco {
-            pin: self.into_alternate(),
+            pin: self.into_mode(),
         }
     }
 }
@@ -56,13 +56,13 @@ pub struct Mco<PIN> {
 impl<PIN> Mco<PIN> {
     pub fn enable(&self) {
         let rcc = unsafe { &(*RCC::ptr()) };
-        rcc.cfgr
+        rcc.cfgr()
             .modify(|_, w| unsafe { w.mcosel().bits(self.src_bits) });
     }
 
     pub fn disable(&self) {
         let rcc = unsafe { &(*RCC::ptr()) };
-        rcc.cfgr.modify(|_, w| unsafe { w.mcosel().bits(0) });
+        rcc.cfgr().modify(|_, w| unsafe { w.mcosel().bits(0) });
     }
 
     pub fn release(self) -> PIN {
@@ -77,8 +77,8 @@ pub trait MCOExt<PIN> {
 macro_rules! mco {
     ($($PIN:ident),+) => {
         $(
-            impl MCOExt<$PIN<Alternate<AF0>>> for $PIN<DefaultMode> {
-                fn mco(self, src: MCOSrc, psc: Prescaler, rcc: &mut Rcc) -> Mco<$PIN<Alternate<AF0>>> {
+            impl MCOExt<crate::gpio::$PIN<AF0>> for crate::gpio::$PIN<DefaultMode> {
+                fn mco(self, src: MCOSrc, psc: Prescaler, rcc: &mut Rcc) -> Mco<crate::gpio::$PIN<AF0>> {
                     let psc_bits = match psc {
                         Prescaler::NotDivided => 0b000,
                         Prescaler::Div2 => 0b001,
@@ -89,7 +89,7 @@ macro_rules! mco {
                         Prescaler::Div64 => 0b110,
                         _ => 0b111,
                     };
-                    rcc.rb.cfgr.modify(|r, w| unsafe {
+                    rcc.rb.cfgr().modify(|r, w| unsafe {
                         w.bits((r.bits() & !(0b111 << 28)) | (psc_bits << 28))
                     });
 
@@ -119,8 +119,5 @@ macro_rules! mco {
         )+
     };
 }
-
-use crate::gpio::gpioa::PA8;
-use crate::gpio::gpiog::PG10;
 
 mco!(PA8, PG10);

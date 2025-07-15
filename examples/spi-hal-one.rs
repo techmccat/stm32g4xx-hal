@@ -50,26 +50,26 @@ fn main() -> ! {
         .SPI1
         .spi((sclk, miso, mosi), spi::MODE_0, 8.MHz(), &mut rcc);
     let mut cs = gpioa.pa8.into_push_pull_output();
-    cs.set_high().unwrap();
+    cs.set_high();
 
     // Odd number of bits to test packing edge case
     const MESSAGE: &[u8] = "Hello world, but longer".as_bytes();
     let received = &mut [0u8; MESSAGE.len()];
 
-    cs.set_low().unwrap();
+    cs.set_low();
     spi.transfer(received, MESSAGE).unwrap();
     // downside of having 8 and 16 bit impls on the same struct is you have to specify which flush
     // impl to call, although internally they call the same function
     SpiBus::<u8>::flush(&mut spi).unwrap();
-    cs.set_high().unwrap();
+    cs.set_high();
     
     info!("Received {:?}", core::str::from_utf8(received).ok());
     assert_eq!(MESSAGE, received);
 
-    cs.set_low().unwrap();
+    cs.set_low();
     spi.transfer_in_place(received).unwrap();
     SpiBus::<u8>::flush(&mut spi).unwrap();
-    cs.set_high().unwrap();
+    cs.set_high();
 
     info!("Received {:?}", core::str::from_utf8(received).ok());
     assert_eq!(MESSAGE, received);
@@ -78,19 +78,19 @@ fn main() -> ! {
     const TX_16B: &[u16] = &[0xf00f, 0xfeef, 0xfaaf];
     let rx_16b = &mut [0u16; TX_16B.len()];
 
-    cs.set_low().unwrap();
+    cs.set_low();
     spi.transfer(rx_16b, TX_16B).unwrap();
     // internally works the same as SpiBus::<u8>::flush()
     SpiBus::<u16>::flush(&mut spi).unwrap();
-    cs.set_high().unwrap();
+    cs.set_high();
 
     info!("Received {:?}", rx_16b);
     assert_eq!(TX_16B, rx_16b);
 
-    cs.set_low().unwrap();
+    cs.set_low();
     spi.transfer_in_place(rx_16b).unwrap();
     SpiBus::<u16>::flush(&mut spi).unwrap();
-    cs.set_high().unwrap();
+    cs.set_high();
 
     info!("Received {:?}", rx_16b);
     assert_eq!(TX_16B, rx_16b);

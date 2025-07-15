@@ -6,7 +6,7 @@ use crate::hal::{
     gpio::{GpioExt as _, Speed},
     nb::block,
     pwr::PwrExt,
-    rcc::{Config, RccExt, SysClockSrc},
+    rcc::{Config, RccExt},
     stm32::Peripherals,
     time::RateExtU32,
 };
@@ -49,7 +49,7 @@ fn main() -> ! {
 
     let pwr = dp.PWR.constrain().freeze();
     let rcc = dp.RCC.constrain();
-    let mut rcc = rcc.freeze(Config::new(SysClockSrc::HSE(24.MHz())), pwr);
+    let mut rcc = rcc.freeze(Config::hse(24.MHz()), pwr);
 
     info!("Split GPIO");
 
@@ -57,11 +57,11 @@ fn main() -> ! {
 
     let can1 = {
         info!("Init CAN 1");
-        let rx = gpiob.pb8.into_alternate().set_speed(Speed::VeryHigh);
-        let tx = gpiob.pb9.into_alternate().set_speed(Speed::VeryHigh);
+        let rx = gpiob.pb8.into_alternate().speed(Speed::VeryHigh);
+        let tx = gpiob.pb9.into_alternate().speed(Speed::VeryHigh);
 
         info!("-- Create CAN 1 instance");
-        let mut can = dp.FDCAN1.fdcan(tx, rx, &rcc);
+        let mut can = dp.FDCAN1.fdcan(tx, rx, &mut rcc);
         can.set_protocol_exception_handling(false);
 
         info!("-- Configure nominal timing");
@@ -82,8 +82,8 @@ fn main() -> ! {
 
     // let can2 = {
     //     info!("Init CAN 2");
-    //     let rx = gpiob.pb5.into_alternate().set_speed(Speed::VeryHigh);
-    //     let tx = gpiob.pb13.into_alternate().set_speed(Speed::VeryHigh);
+    //     let rx = gpiob.pb5.into_alternate().speed(Speed::VeryHigh);
+    //     let tx = gpiob.pb13.into_alternate().speed(Speed::VeryHigh);
 
     //     info!("-- Create CAN 2 instance");
     //     let mut can = dp.FDCAN2.fdcan(tx, rx, &rcc);
@@ -121,6 +121,7 @@ fn main() -> ! {
     block!(can.transmit(header, &buffer)).unwrap();
 
     loop {
+        #[allow(irrefutable_let_patterns)]
         if let Ok(rxheader) = block!(can.receive0(&mut buffer)) {
             block!(can.transmit(rxheader.unwrap().to_tx_header(None), &buffer)).unwrap();
         }

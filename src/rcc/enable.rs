@@ -5,7 +5,7 @@ macro_rules! bus_enable {
     ($PER:ident => ($busX:ty, $bit:literal)) => {
         impl Enable for crate::stm32::$PER {
             #[inline(always)]
-            fn enable(rcc: &RccRB) {
+            fn enable(rcc: &mut RCC) {
                 unsafe {
                     bb::set(Self::Bus::enr(rcc), $bit);
                 }
@@ -13,17 +13,41 @@ macro_rules! bus_enable {
                 // cortex_m::asm::dsb();
             }
             #[inline(always)]
-            fn disable(rcc: &RccRB) {
+            fn disable(rcc: &mut RCC) {
                 unsafe {
                     bb::clear(Self::Bus::enr(rcc), $bit);
                 }
             }
-
             #[inline(always)]
-            fn enable_for_sleep_stop(rcc: &RccRB) {
+            fn is_enabled() -> bool {
+                let rcc = unsafe { &*RCC::ptr() };
+                (Self::Bus::enr(rcc).read().bits() >> $bit) & 0x1 != 0
+            }
+        }
+    };
+}
+
+macro_rules! bus_smenable {
+    ($PER:ident => ($busX:ty, $bit:literal)) => {
+        impl SMEnable for crate::stm32::$PER {
+            #[inline(always)]
+            fn sleep_mode_enable(rcc: &mut RCC) {
                 unsafe {
                     bb::set(Self::Bus::smenr(rcc), $bit);
                 }
+                // // Stall the pipeline to work around erratum 2.1.13 (DM00037591)
+                // cortex_m::asm::dsb();
+            }
+            #[inline(always)]
+            fn sleep_mode_disable(rcc: &mut RCC) {
+                unsafe {
+                    bb::clear(Self::Bus::smenr(rcc), $bit);
+                }
+            }
+            #[inline(always)]
+            fn is_sleep_mode_enabled() -> bool {
+                let rcc = unsafe { &*RCC::ptr() };
+                (Self::Bus::smenr(rcc).read().bits() >> $bit) & 0x1 != 0
             }
         }
     };
@@ -33,7 +57,7 @@ macro_rules! bus_reset {
     ($PER:ident => ($busX:ty, $bit:literal)) => {
         impl Reset for crate::stm32::$PER {
             #[inline(always)]
-            fn reset(rcc: &RccRB) {
+            fn reset(rcc: &mut RCC) {
                 unsafe {
                     bb::set(Self::Bus::rstr(rcc), $bit);
                     bb::clear(Self::Bus::rstr(rcc), $bit);
@@ -46,12 +70,12 @@ macro_rules! bus_reset {
 macro_rules! bus {
     ($($PER:ident => ($busX:ty, $bit:literal),)+) => {
         $(
-            impl crate::Sealed for crate::stm32::$PER {}
             impl RccBus for crate::stm32::$PER {
                 type Bus = $busX;
             }
             impl crate::rcc::Instance for crate::stm32::$PER {}
             bus_enable!($PER => ($busX, $bit));
+            bus_smenable!($PER => ($busX, $bit));
             bus_reset!($PER => ($busX, $bit));
         )+
     }
@@ -75,8 +99,7 @@ bus! {
     GPIOE => (AHB2, 4),
     GPIOF => (AHB2, 5),
     GPIOG => (AHB2, 6),
-    ADC1 => (AHB2, 13),
-    ADC2 => (AHB2, 13),
+    ADC12_COMMON => (AHB2, 13),
     DAC1 => (AHB2, 16),
     DAC2 => (AHB2, 17),
     DAC3 => (AHB2, 18),
@@ -85,25 +108,15 @@ bus! {
 }
 
 #[cfg(any(
-    feature = "stm32g471",
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
-    feature = "stm32g484"
+    feature = "stm32g484",
+    feature = "stm32g491",
+    feature = "stm32g4a1",
 ))]
 bus! {
-    ADC3 => (AHB2, 14),
-}
-
-#[cfg(any(
-    feature = "stm32g473",
-    feature = "stm32g474",
-    feature = "stm32g483",
-    feature = "stm32g484"
-))]
-bus! {
-    ADC4 => (AHB2, 14),
-    ADC5 => (AHB2, 14),
+    ADC345_COMMON => (AHB2, 14),
 }
 
 #[cfg(any(feature = "stm32g431", feature = "stm32g441", feature = "stm32g484",))]
@@ -146,7 +159,6 @@ bus! {
 }
 
 #[cfg(any(
-    feature = "stm32g471",
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
@@ -159,7 +171,16 @@ bus! {
 }
 
 #[cfg(any(
-    feature = "stm32g471",
+    feature = "stm32g473",
+    feature = "stm32g474",
+    feature = "stm32g483",
+    feature = "stm32g484",
+))]
+bus! {
+    FDCAN3 => (APB1_1, 25),
+}
+
+#[cfg(any(
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
@@ -167,8 +188,19 @@ bus! {
 ))]
 bus! {
     TIM5 => (APB1_1, 3),
-    UART5 => (APB1_1, 20),
     I2C4 => (APB1_2, 1),
+}
+
+#[cfg(any(
+    feature = "stm32g473",
+    feature = "stm32g474",
+    feature = "stm32g483",
+    feature = "stm32g484",
+    feature = "stm32g491",
+    feature = "stm32g4a1",
+))]
+bus! {
+    UART5 => (APB1_1, 20),
 }
 
 bus! {
@@ -184,7 +216,6 @@ bus! {
 }
 
 #[cfg(any(
-    feature = "stm32g471",
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
@@ -198,10 +229,11 @@ bus! {
     feature = "stm32g473",
     feature = "stm32g474",
     feature = "stm32g483",
-    feature = "stm32g484"
+    feature = "stm32g484",
+    feature = "stm32g491",
+    feature = "stm32g4a1",
 ))]
 bus! {
-    FDCAN3 => (APB1_1, 25),
     TIM20 => (APB2, 20),
 }
 
@@ -213,4 +245,9 @@ bus! {
     HRTIM_TIMD => (APB2, 26),
     HRTIM_TIME => (APB2, 26),
     HRTIM_TIMF => (APB2, 26),
+}
+
+#[cfg(any(feature = "stm32g474", feature = "stm32g484"))]
+bus! {
+    HRTIM_COMMON => (APB2, 26),
 }

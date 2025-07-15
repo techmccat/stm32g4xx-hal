@@ -6,11 +6,7 @@
 
 use crate::hal::{
     delay::DelayFromCountDownTimer,
-    gpio::gpioa::PA5,
-    gpio::gpioa::PA6,
-    gpio::gpioa::PA7,
-    gpio::Alternate,
-    gpio::AF5,
+    gpio::{AF5, PA5, PA6, PA7},
     prelude::*,
     pwr::PwrExt,
     rcc::Config,
@@ -22,8 +18,8 @@ use crate::hal::{
 
 use cortex_m_rt::entry;
 use stm32g4xx_hal as hal;
+use stm32g4xx_hal::dma::channel::DMAExt;
 use stm32g4xx_hal::dma::config::DmaConfig;
-use stm32g4xx_hal::dma::stream::DMAExt;
 use stm32g4xx_hal::dma::TransferExt;
 
 #[macro_use]
@@ -44,14 +40,14 @@ fn main() -> ! {
     let mut delay_tim2 = DelayFromCountDownTimer::new(timer2.start_count_down(100.millis()));
 
     let gpioa = dp.GPIOA.split(&mut rcc);
-    let sclk: PA5<Alternate<AF5>> = gpioa.pa5.into_alternate();
-    let miso: PA6<Alternate<AF5>> = gpioa.pa6.into_alternate();
-    let mosi: PA7<Alternate<AF5>> = gpioa.pa7.into_alternate();
+    let sclk: PA5<AF5> = gpioa.pa5.into_alternate();
+    let miso: PA6<AF5> = gpioa.pa6.into_alternate();
+    let mosi: PA7<AF5> = gpioa.pa7.into_alternate();
 
     let spi = dp
         .SPI1
         .spi((sclk, miso, mosi), spi::MODE_0, 400.kHz(), &mut rcc);
-    let streams = dp.DMA1.split(&rcc);
+    let channels = dp.DMA1.split(&rcc);
     let config = DmaConfig::default()
         .transfer_complete_interrupt(false)
         .circular_buffer(true)
@@ -63,10 +59,11 @@ fn main() -> ! {
         *item = index as u8;
     }
     let dma_buf = cortex_m::singleton!(: [u8; BUFFER_SIZE] = buf).unwrap();
-    let mut transfer_dma =
-        streams
-            .0
-            .into_memory_to_peripheral_transfer(spi.enable_tx_dma(), &mut dma_buf[..], config);
+    let mut transfer_dma = channels.ch1.into_memory_to_peripheral_transfer(
+        spi.enable_tx_dma(),
+        &mut dma_buf[..],
+        config,
+    );
     transfer_dma.start(|_spi| {});
     loop {
         delay_tim2.delay_ms(1000);

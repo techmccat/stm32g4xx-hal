@@ -44,10 +44,18 @@ cargo run --example blinky_delay --features stm32g474,log-rtt,defmt --release --
 A list of chips supported by probe-rs can be found by running
 
 ```
-probe-run --list-chips
+probe-rs chip list
 ```
 
-For furher information, see the documentation for [probe-run](https://github.com/knurling-rs/probe-run).
+For furher information, see the documentation for [probe-rs](https://github.com/probe-rs/probe-rs).
+
+#### Running tests on a Nucleo-G474RE
+
+First move jumper from CN12 and put it between A1 and A2 on CN8
+
+```bash
+cargo test --features stm32g474,defmt,cordic --tests -- --chip stm32g474RETx
+```
 
 ### Using as a Dependency
 
