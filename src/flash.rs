@@ -148,7 +148,7 @@ impl<const SECTOR_SZ_KB: u32> FlashWriter<'_, SECTOR_SZ_KB> {
             return Err(Error::LengthTooLong);
         }
 
-        if !force_padding && length % 8 != 0 {
+        if !force_padding && !length.is_multiple_of(8) {
             return Err(Error::ArrayMustBeDivisibleBy8);
         }
 
@@ -298,10 +298,9 @@ impl<const SECTOR_SZ_KB: u32> FlashWriter<'_, SECTOR_SZ_KB> {
                     | ((data[idx + 7] as u32) << 24);
             }
 
+            while self.flash.sr.sr().read().bsy().bit_is_set() {}
             // Set Page Programming to 1
             self.flash.cr.cr().modify(|_, w| w.pg().set_bit());
-
-            while self.flash.sr.sr().read().bsy().bit_is_set() {}
 
             // NOTE(unsafe) Write to FLASH area with no side effects
             unsafe { core::ptr::write_volatile(write_address1, word1) };
@@ -310,6 +309,7 @@ impl<const SECTOR_SZ_KB: u32> FlashWriter<'_, SECTOR_SZ_KB> {
             // Wait for write
             while self.flash.sr.sr().read().bsy().bit_is_set() {}
 
+            self.flash.sr.sr().modify(|_, w| w.eop().clear_bit());
             // Set Page Programming to 0
             self.flash.cr.cr().modify(|_, w| w.pg().clear_bit());
 
@@ -428,7 +428,7 @@ pub struct Parts {
 }
 impl Parts {
     #[cfg(any(feature = "stm32g431", feature = "stm32g441",))]
-    pub fn writer(&mut self, flash_sz: FlashSize) -> FlashWriter<{ 2 * SZ_1K }> {
+    pub fn writer(&mut self, flash_sz: FlashSize) -> FlashWriter<'_, { 2 * SZ_1K }> {
         FlashWriter {
             flash: self,
             flash_sz,
@@ -446,7 +446,7 @@ impl Parts {
     pub fn writer<const PAGE_SIZE_KB: u32>(
         &mut self,
         flash_sz: FlashSize,
-    ) -> FlashWriter<PAGE_SIZE_KB> {
+    ) -> FlashWriter<'_, PAGE_SIZE_KB> {
         FlashWriter {
             flash: self,
             flash_sz,

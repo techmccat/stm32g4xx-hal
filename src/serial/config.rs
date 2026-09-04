@@ -61,6 +61,8 @@ pub struct LowPowerConfig {
     pub(crate) parity: Parity,
     pub(crate) stopbits: StopBits,
     pub(crate) swap: bool,
+    pub(crate) tx_invert: bool,
+    pub(crate) rx_invert: bool,
     pub(crate) fifo_enable: bool,
     pub(crate) tx_fifo_threshold: FifoThreshold,
     pub(crate) rx_fifo_threshold: FifoThreshold,
@@ -75,6 +77,8 @@ pub struct FullConfig {
     pub(crate) parity: Parity,
     pub(crate) stopbits: StopBits,
     pub(crate) swap: bool,
+    pub(crate) tx_invert: bool,
+    pub(crate) rx_invert: bool,
     pub(crate) fifo_enable: bool,
     pub(crate) tx_fifo_threshold: FifoThreshold,
     pub(crate) rx_fifo_threshold: FifoThreshold,
@@ -105,6 +109,11 @@ impl LowPowerConfig {
         self
     }
 
+    pub fn wordlength_7(mut self) -> Self {
+        self.wordlength = WordLength::DataBits7;
+        self
+    }
+
     pub fn wordlength_8(mut self) -> Self {
         self.wordlength = WordLength::DataBits8;
         self
@@ -125,6 +134,24 @@ impl LowPowerConfig {
     /// The peripheral will transmit on the pin given as the `rx` argument.
     pub fn swap_pins(mut self) -> Self {
         self.swap = true;
+        self
+    }
+
+    /// Invert the polarity of the Tx pin
+    ///
+    /// The peripheral will treat VDD as a "low" (mark) line value and Gnd as a "high" (idle)
+    /// value for the Tx pin.
+    pub fn tx_invert(mut self) -> Self {
+        self.tx_invert = true;
+        self
+    }
+
+    /// Invert the polarity of the Rx pin
+    ///
+    /// The peripheral will treat VDD as a "low" (mark) line value and Gnd as a "high" (idle)
+    /// value for the Rx pin.
+    pub fn rx_invert(mut self) -> Self {
+        self.rx_invert = true;
         self
     }
 
@@ -175,6 +202,11 @@ impl FullConfig {
         self
     }
 
+    pub fn wordlength_7(mut self) -> Self {
+        self.wordlength = WordLength::DataBits7;
+        self
+    }
+
     pub fn wordlength_8(mut self) -> Self {
         self.wordlength = WordLength::DataBits8;
         self
@@ -195,6 +227,24 @@ impl FullConfig {
     /// The peripheral will transmit on the pin given as the `rx` argument.
     pub fn swap_pins(mut self) -> Self {
         self.swap = true;
+        self
+    }
+
+    /// Invert the polarity of the Tx pin
+    ///
+    /// The peripheral will treat VDD as a "low" (mark) line value and Gnd as a "high" (idle)
+    /// value for the Tx pin.
+    pub fn tx_invert(mut self) -> Self {
+        self.tx_invert = true;
+        self
+    }
+
+    /// Invert the polarity of the Rx pin
+    ///
+    /// The peripheral will treat VDD as a "low" (mark) line value and Gnd as a "high" (idle)
+    /// value for the Rx pin.
+    pub fn rx_invert(mut self) -> Self {
+        self.rx_invert = true;
         self
     }
 
@@ -243,6 +293,8 @@ impl Default for LowPowerConfig {
             parity: Parity::ParityNone,
             stopbits: StopBits::STOP1,
             swap: false,
+            tx_invert: false,
+            rx_invert: false,
             fifo_enable: false,
             tx_fifo_threshold: FifoThreshold::FIFO_8_BYTES,
             rx_fifo_threshold: FifoThreshold::FIFO_8_BYTES,
@@ -261,6 +313,8 @@ impl Default for FullConfig {
             parity: Parity::ParityNone,
             stopbits: StopBits::STOP1,
             swap: false,
+            tx_invert: false,
+            rx_invert: false,
             fifo_enable: false,
             tx_fifo_threshold: FifoThreshold::FIFO_8_BYTES,
             rx_fifo_threshold: FifoThreshold::FIFO_8_BYTES,

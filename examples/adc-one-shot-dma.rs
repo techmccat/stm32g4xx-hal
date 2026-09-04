@@ -40,7 +40,7 @@ fn main() -> ! {
     let pwr = dp.PWR.constrain().freeze();
     let mut rcc = rcc.freeze(Config::hsi(), pwr);
 
-    let mut channels = dp.DMA1.split(&rcc);
+    let channels = dp.DMA1.split(&rcc);
     let config = DmaConfig::default()
         .transfer_complete_interrupt(false)
         .circular_buffer(false)
@@ -77,10 +77,8 @@ fn main() -> ! {
     info!("Conversion Done");
 
     transfer.pause(|adc| adc.cancel_conversion());
-    let (ch1, adc, first_buffer) = transfer.free();
+    let (_ch1, adc, first_buffer) = transfer.free();
     let adc = adc.disable();
-
-    channels.ch1 = ch1;
 
     let millivolts = adc.sample_to_millivolts(first_buffer[0]);
     info!("pa3: {}mV", millivolts);

@@ -51,7 +51,10 @@ For furher information, see the documentation for [probe-rs](https://github.com/
 
 #### Running tests on a Nucleo-G474RE
 
-First move jumper from CN12 and put it between A1 and A2 on CN8
+First move jumper from CN11 and CN12 and put them between A1 and A2 on CN8. And D11, D12 on CN5.
+
+A1<->A2 (arduino naming) aka PA1<->PA4
+D11<->D12 (arduino naming) aka PA6<->PA7
 
 ```bash
 cargo test --features stm32g474,defmt,cordic --tests -- --chip stm32g474RETx
@@ -64,7 +67,7 @@ be specified as part of the `Cargo.toml` definition.
 
 ```
 [dependencies]
-stm32g4xx-hal = "0.0.0"
+stm32g4xx-hal = { version = "0.1.0", features = ["stm32g474", "defmt"] }
 ```
 
 ## Documentation

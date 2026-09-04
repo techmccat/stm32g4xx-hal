@@ -93,6 +93,7 @@ pub mod syscfg;
 pub mod time;
 pub mod timer;
 // pub mod watchdog;
+pub mod rng;
 
 #[cfg(all(
     feature = "hrtim",
@@ -116,14 +117,41 @@ impl<RB, const A: usize> Sealed for Periph<RB, A> {}
 pub trait Ptr: Sealed {
     /// RegisterBlock structure
     type RB;
+    /// Pointer to the register block
+    const PTR: *const Self::RB;
     /// Return the pointer to the register block
-    fn ptr() -> *const Self::RB;
+    #[inline(always)]
+    fn ptr() -> *const Self::RB {
+        Self::PTR
+    }
 }
 
 impl<RB, const A: usize> Ptr for Periph<RB, A> {
     type RB = RB;
-    fn ptr() -> *const Self::RB {
-        Self::ptr()
+    const PTR: *const Self::RB = Self::PTR;
+}
+
+pub trait Steal: Sealed {
+    /// Steal an instance of this peripheral
+    ///
+    /// # Safety
+    ///
+    /// Ensure that the new instance of the peripheral cannot be used in a way
+    /// that may race with any existing instances, for example by only
+    /// accessing read-only or write-only registers, or by consuming the
+    /// original peripheral and using critical sections to coordinate
+    /// access between multiple new instances.
+    ///
+    /// Additionally the HAL may rely on only one
+    /// peripheral instance existing to ensure memory safety; ensure
+    /// no stolen instances are passed to such software.
+    unsafe fn steal() -> Self;
+}
+
+impl<RB, const A: usize> Steal for Periph<RB, A> {
+    #[inline(always)]
+    unsafe fn steal() -> Self {
+        Self::steal()
     }
 }
 

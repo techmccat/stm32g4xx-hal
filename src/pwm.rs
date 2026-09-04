@@ -191,7 +191,7 @@ use crate::stm32::TIM20;
 use crate::stm32::TIM5;
 use crate::stm32::{TIM1, TIM15, TIM16, TIM17, TIM2, TIM3, TIM4, TIM8};
 
-use crate::rcc::{Enable, GetBusFreq, Rcc, Reset};
+use crate::rcc::{BusTimerClock, Enable, Rcc, RccBus, Reset};
 use crate::time::{ExtU32, Hertz, NanoSecond, RateExtU32};
 
 #[cfg(any(
@@ -1149,7 +1149,7 @@ macro_rules! tim_hal {
                 $TIMX::enable(rcc);
                 $TIMX::reset(rcc);
 
-                let clk = $TIMX::get_timer_frequency(&rcc.clocks);
+                let clk = <$TIMX as RccBus>::Bus::timer_clock(&rcc.clocks);
 
                 let (period, prescale) = match $bits {
                     16 => calculate_frequency_16bit(clk, freq, Alignment::Left),
@@ -1188,7 +1188,7 @@ macro_rules! tim_hal {
                     $TIMX::enable(rcc);
                     $TIMX::reset(rcc);
 
-                    let clk = $TIMX::get_timer_frequency(&rcc.clocks).raw();
+                    let clk = <$TIMX as RccBus>::Bus::timer_clock(&rcc.clocks).raw();
 
                     PwmBuilder {
                         _tim: PhantomData,
@@ -1797,7 +1797,7 @@ macro_rules! lptim_hal {
                 $TIMX::enable(rcc);
                 $TIMX::reset(rcc);
 
-                let clk = $TIMX::get_timer_frequency(&rcc.clocks);
+                let clk = <$TIMX as RccBus>::Bus::timer_clock(&rcc.clocks);
                 let reload = clk / freq;
                 assert!(reload < 128 * (1 << 16));
 

@@ -7,7 +7,6 @@
 
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
-use core::ops::Deref;
 
 use crate::gpio::{Analog, PA4, PA5, PA6};
 use crate::pac;
@@ -150,13 +149,7 @@ pub trait Generator {}
 impl Generator for WaveGenerator {}
 impl Generator for SawtoothConfig {}
 
-pub trait Instance:
-    rcc::Enable
-    + rcc::Reset
-    + crate::Ptr<RB = crate::pac::dac1::RegisterBlock>
-    + Deref<Target = Self::RB>
-{
-}
+pub trait Instance: rcc::Instance + crate::Ptr<RB = crate::pac::dac1::RegisterBlock> {}
 
 pub struct DacCh<DAC: Instance, const CH: u8, const MODE_BITS: u8, ED> {
     _marker: PhantomData<(DAC, ED)>,

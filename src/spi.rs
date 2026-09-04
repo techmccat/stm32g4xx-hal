@@ -2,7 +2,7 @@ use crate::dma::mux::DmaMuxResources;
 use crate::dma::traits::TargetAddress;
 use crate::dma::MemoryToPeripheral;
 use crate::gpio;
-use crate::rcc::{Enable, GetBusFreq, Rcc, Reset};
+use crate::rcc::{BusClock, Rcc};
 #[cfg(any(
     feature = "stm32g473",
     feature = "stm32g474",
@@ -12,7 +12,7 @@ use crate::rcc::{Enable, GetBusFreq, Rcc, Reset};
 use crate::stm32::SPI4;
 use crate::stm32::{spi1, SPI1, SPI2, SPI3};
 use crate::time::Hertz;
-use core::{ops::Deref, ptr};
+use core::ptr;
 
 use embedded_hal::spi::ErrorKind;
 pub use embedded_hal::spi::{Mode, Phase, Polarity, MODE_0, MODE_1, MODE_2, MODE_3};
@@ -85,9 +85,7 @@ impl FrameSize for u16 {
     const DFF: bool = true;
 }
 
-pub trait Instance:
-    crate::Sealed + Deref<Target = spi1::RegisterBlock> + Enable + Reset + GetBusFreq
-{
+pub trait Instance: crate::rcc::Instance + crate::Ptr<RB = spi1::RegisterBlock> {
     const DMA_MUX_RESOURCE: DmaMuxResources;
 }
 
@@ -293,7 +291,7 @@ impl<SPI: Instance> SpiExt<SPI> for SPI {
         Self::reset(rcc);
 
         let spi_freq = freq.into().raw();
-        let bus_freq = SPI::get_frequency(&rcc.clocks).raw();
+        let bus_freq = SPI::Bus::clock(&rcc.clocks).raw();
         setup_spi_regs(&self, spi_freq, bus_freq, mode);
 
         Spi { spi: self, pins }

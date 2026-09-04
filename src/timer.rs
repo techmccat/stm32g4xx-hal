@@ -10,7 +10,7 @@ use cortex_m::peripheral::{DCB, DWT, SYST};
 use embedded_hal_old::timer::{Cancel, CountDown as _, Periodic};
 use void::Void;
 
-use crate::rcc::{self, Clocks};
+use crate::rcc::{self, BusTimerClock, Clocks, RccBus};
 use crate::time::{Hertz, MicroSecond};
 
 /// Timer wrapper
@@ -202,7 +202,7 @@ impl Instant {
     }
 }
 
-pub trait Instance: crate::Sealed + rcc::Enable + rcc::Reset + rcc::GetBusFreq {}
+pub trait Instance: rcc::Instance + RccBus<Bus: BusTimerClock> {}
 
 impl<TIM> Timer<TIM>
 where
@@ -219,7 +219,7 @@ where
         }
 
         Self {
-            clk: TIM::get_timer_frequency(clocks),
+            clk: TIM::Bus::timer_clock(clocks),
             tim,
         }
     }

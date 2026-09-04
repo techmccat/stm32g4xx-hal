@@ -9,7 +9,7 @@ license = "MIT/Apache-2.0"
 name = "stm32g4xx-hal"
 readme = "README.md"
 repository = "https://github.com/stm32-rs/stm32g4xx-hal"
-version = "0.0.2"
+version = "0.1.0"
 
 [dependencies]
 nb = "1"
@@ -20,6 +20,7 @@ stm32-usbd = { version = "0.7.0", optional = true }
 fixed = { version = "1.28.0", optional = true }
 embedded-io = "0.6"
 stm32-hrtim = { version = "0.1.0", optional = true }
+rand_core = { version = "0.9", default-features = false }
 
 [dependencies.cortex-m]
 version = "0.7.7"
@@ -72,6 +73,7 @@ bme680 = "0.6.0"
 embedded-sdmmc = "0.3.0"
 usb-device = { version = "0.3.2", features = ["defmt"] }
 usbd-serial = "0.2.2"
+rand = { version = "0.9", default-features = false }
 
 #TODO: Separate feature sets
 [features]
