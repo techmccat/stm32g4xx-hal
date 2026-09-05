@@ -12,8 +12,11 @@ use crate::rcc::{BusClock, Rcc};
 use crate::stm32::SPI4;
 use crate::stm32::{spi1, SPI1, SPI2, SPI3};
 use crate::time::Hertz;
+use core::future::poll_fn;
+use core::marker::PhantomData;
 use core::ptr;
 
+use atomic_waker::AtomicWaker;
 use embedded_hal::spi::ErrorKind;
 pub use embedded_hal::spi::{Mode, Phase, Polarity, MODE_0, MODE_1, MODE_2, MODE_3};
 
@@ -67,6 +70,14 @@ pub struct Spi<SPI, PINS> {
     pins: PINS,
 }
 
+#[derive(Debug)]
+pub struct SpiAsyncBasic<SPI, PINS> {
+    inner: Spi<SPI, PINS>
+}
+pub struct SpiIrqBasic<SPI> {
+    _spi: PhantomData<SPI>
+}
+
 pub trait SpiExt<SPI>: Sized {
     fn spi<PINS, T>(self, pins: PINS, mode: Mode, freq: T, rcc: &mut Rcc) -> Spi<SPI, PINS>
     where
@@ -87,6 +98,10 @@ impl FrameSize for u16 {
 
 pub trait Instance: crate::rcc::Instance + crate::Ptr<RB = spi1::RegisterBlock> {
     const DMA_MUX_RESOURCE: DmaMuxResources;
+}
+
+pub trait AsyncInstanceBasic: Instance {
+    fn waker() -> &'static AtomicWaker;
 }
 
 unsafe impl<SPI: Instance, PINS> TargetAddress<MemoryToPeripheral> for Spi<SPI, PINS> {
@@ -125,6 +140,100 @@ macro_rules! spi {
         impl Instance for $SPIX {
             const DMA_MUX_RESOURCE: DmaMuxResources = $mux;
         }
+
+        impl AsyncInstanceBasic for $SPIX {
+            fn waker() -> &'static AtomicWaker {
+                static WAKER: AtomicWaker = AtomicWaker::new();
+                return &WAKER
+            }
+        }
+    }
+}
+
+impl<SPI: AsyncInstanceBasic, PINS> Spi<SPI, PINS> {
+    pub fn into_async_basic(self) -> (SpiAsyncBasic<SPI, PINS>, SpiIrqBasic<SPI>) {
+        (SpiAsyncBasic { inner: self }, SpiIrqBasic { _spi: PhantomData })
+    }
+}
+
+impl<SPI: AsyncInstanceBasic> SpiIrqBasic<SPI> {
+    /// Must be called after the corresponding SPI interrupt
+    pub fn on_irq(&self) {
+        let spi = unsafe { SPI::PTR.as_ref_unchecked() };
+        spi.cr2().modify(|_, w| w.txeie().clear_bit());
+        SPI::waker().wake();
+    }
+}
+
+impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::ErrorType for SpiAsyncBasic<SPI, PINS> {
+    type Error = Error;
+}
+impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::SpiBus for SpiAsyncBasic<SPI, PINS> {
+    async fn read(&mut self, _words: &mut [u8]) -> Result<(), Self::Error> {
+        todo!()
+    }
+    async fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+        self.inner.set_tx_only();
+
+        if words.len() > 1 {
+            let mut write_iter = words.chunks_exact(2).map(|two|
+                // safety: chunks_exact guarantees that chunks have 2 elements
+                // second byte in send queue goes to the top of the 16-bit data register for
+                // packing
+                u16::from_le_bytes(unsafe { *two.as_ptr().cast() }));
+
+            let res = poll_fn(|cx: &mut core::task::Context|
+                if let Some(next) = write_iter.next() {
+                    if let Err(nb::Error::Other(e)) = self.inner.nb_write(next) {
+                        return core::task::Poll::Ready(Err(e))
+                    }
+                    SPI::waker().register(cx.waker());
+                    self.inner.spi.cr2().modify(|_, w| w.txeie().set_bit());
+
+                    core::task::Poll::Pending
+                } else {
+                    core::task::Poll::Ready(Ok(()))
+                }
+            ).await;
+            // also clear txeie in case of error
+            self.inner.spi.cr2().modify(|_, w| w.txeie().clear_bit());
+            res?;
+        }
+
+        if !words.len().is_multiple_of(2) {
+            let last = *words.last().unwrap();
+            let res = poll_fn(|cx: &mut core::task::Context| 
+                if let Err(nb::Error::Other(e)) = self.inner.nb_write(last) {
+                    core::task::Poll::Ready(Err(e))
+                } else {
+                    self.inner.spi.cr2().modify(|_, w| w.txeie().set_bit());
+                    SPI::waker().register(cx.waker());
+                    core::task::Poll::Pending
+                }
+            ).await;
+            self.inner.spi.cr2().modify(|_, w| w.txeie().clear_bit());
+            res
+        } else {
+            Ok(())
+        }
+    }
+    async fn transfer(&mut self, _read: &mut [u8], _write: &[u8]) -> Result<(), Self::Error> {
+        todo!()
+    }
+    async fn transfer_in_place(&mut self, _words: &mut [u8]) -> Result<(), Self::Error> {
+        todo!()
+    }
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.inner.set_tx_only();
+        // poll busy flag but yield to other tasks
+        poll_fn(|cx|
+            if self.inner.spi.sr().read().bsy().bit() {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            } else {
+                core::task::Poll::Ready(Ok(()))
+            }
+        ).await
     }
 }
 
