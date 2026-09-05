@@ -45,7 +45,7 @@ mod app {
         let mosi = gpiob.pb5.into_alternate();
         let pins = (sck, miso, mosi);
 
-        let spi = cx.device.SPI1.spi(pins, MODE_1, 1u32.MHz(), &mut rcc);
+        let spi = cx.device.SPI1.spi(pins, MODE_1, 2u32.MHz(), &mut rcc);
         let (spi_async, spi_irq) = spi.into_async_basic();
 
         transmit::spawn().ok();

@@ -182,19 +182,26 @@ impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::SpiBus for SpiAsync
                 // packing
                 u16::from_le_bytes(unsafe { *two.as_ptr().cast() }));
 
-            let res = poll_fn(|cx: &mut core::task::Context|
-                if let Some(next) = write_iter.next() {
-                    if let Err(nb::Error::Other(e)) = self.inner.nb_write(next) {
-                        return core::task::Poll::Ready(Err(e))
-                    }
+            let res = poll_fn(|cx: &mut core::task::Context| {
+                if let Err(e) = self.inner.err_check() {
+                    return core::task::Poll::Ready(Err(e))
+                };
+
+                let cap = self.inner.tx_fifo_cap() / 2;
+                let mut over = true;
+                for next in write_iter.by_ref().take(cap as usize) {
+                    self.inner.write_unchecked(next);
+                    over = false;
+                }
+
+                if over && cap != 0 {
+                    core::task::Poll::Ready(Ok(()))
+                } else {
                     SPI::waker().register(cx.waker());
                     self.inner.spi.cr2().modify(|_, w| w.txeie().set_bit());
-
                     core::task::Poll::Pending
-                } else {
-                    core::task::Poll::Ready(Ok(()))
                 }
-            ).await;
+            }).await;
             // also clear txeie in case of error
             self.inner.spi.cr2().modify(|_, w| w.txeie().clear_bit());
             res?;
@@ -247,6 +254,27 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
         Spi {
             spi: self.spi,
             pins: self.pins,
+        }
+    }
+
+    fn err_check(&self) -> Result<(), Error> {
+        let sr = self.spi.sr().read();
+        const EMASK: u16 = 1 << 4 // crcerr
+            | 1 << 5 // modf
+            | 1 << 6; // ovr
+        if sr.bits() & EMASK == 0 {
+            Ok(())
+        } else {
+            Err(if sr.ovr().bit_is_set() {
+                Error::Overrun
+            } else if sr.modf().bit_is_set() {
+                Error::ModeFault
+            } else if sr.crcerr().bit_is_set() {
+                Error::Crc
+            } else {
+                // FRE unreachable outside I2S or SPI TI slave mode
+                unreachable!();
+            })
         }
     }
 
