@@ -12,16 +12,19 @@ use crate::rcc::{BusClock, Rcc};
 use crate::stm32::SPI4;
 use crate::stm32::{spi1, SPI1, SPI2, SPI3};
 use crate::time::Hertz;
+use core::cell::UnsafeCell;
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::ptr;
+use core::sync::atomic::AtomicBool;
+use core::task::Poll;
 
 use atomic_waker::AtomicWaker;
 use embedded_hal::spi::ErrorKind;
 pub use embedded_hal::spi::{Mode, Phase, Polarity, MODE_0, MODE_1, MODE_2, MODE_3};
 
 /// SPI error
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Error {
     /// Overrun occurred
     Overrun,
@@ -78,6 +81,16 @@ pub struct SpiIrqBasic<SPI> {
     _spi: PhantomData<SPI>
 }
 
+pub struct SpiAsyncFast<SPI, PINS> {
+    inner: Spi<SPI, PINS>,
+    state: &'static SpiStateAsync,
+}
+
+pub struct SpiIrqFast<SPI> {
+    spi: SPI,
+    state: &'static SpiStateAsync,
+}
+
 pub trait SpiExt<SPI>: Sized {
     fn spi<PINS, T>(self, pins: PINS, mode: Mode, freq: T, rcc: &mut Rcc) -> Spi<SPI, PINS>
     where
@@ -100,8 +113,179 @@ pub trait Instance: crate::rcc::Instance + crate::Ptr<RB = spi1::RegisterBlock> 
     const DMA_MUX_RESOURCE: DmaMuxResources;
 }
 
+/// Private trait to hold the refactored common SPI utility methods
+trait InstanceExt: Instance {
+    fn err_check(&self) -> Result<(), Error> {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        let sr = spi.sr().read();
+        const EMASK: u16 = 1 << 4 // crcerr
+            | 1 << 5 // modf
+            | 1 << 6; // ovr
+        if sr.bits() & EMASK == 0 {
+            Ok(())
+        } else {
+            Err(if sr.ovr().bit_is_set() {
+                Error::Overrun
+            } else if sr.modf().bit_is_set() {
+                Error::ModeFault
+            } else if sr.crcerr().bit_is_set() {
+                Error::Crc
+            } else {
+                // FRE unreachable outside I2S or SPI TI slave mode
+                unreachable!();
+            })
+        }
+    }
+
+    #[inline]
+    fn nb_read<W: FrameSize>(&mut self) -> nb::Result<W, Error> {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        let sr = spi.sr().read();
+        Err(if sr.ovr().bit_is_set() {
+            nb::Error::Other(Error::Overrun)
+        } else if sr.modf().bit_is_set() {
+            nb::Error::Other(Error::ModeFault)
+        } else if sr.crcerr().bit_is_set() {
+            nb::Error::Other(Error::Crc)
+        } else if sr.rxne().bit_is_set() {
+            return Ok(self.read_unchecked());
+        } else {
+            nb::Error::WouldBlock
+        })
+    }
+
+    #[inline]
+    fn nb_write<W: FrameSize>(&mut self, word: W) -> nb::Result<(), Error> {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        let sr = spi.sr().read();
+        Err(if sr.ovr().bit_is_set() {
+            nb::Error::Other(Error::Overrun)
+        } else if sr.modf().bit_is_set() {
+            nb::Error::Other(Error::ModeFault)
+        } else if sr.crcerr().bit_is_set() {
+            nb::Error::Other(Error::Crc)
+        } else if sr.txe().bit_is_set() {
+            self.write_unchecked(word);
+            return Ok(());
+        } else {
+            nb::Error::WouldBlock
+        })
+    }
+
+    #[inline]
+    fn nb_read_no_err<W: FrameSize>(&mut self) -> nb::Result<W, core::convert::Infallible> {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        if spi.sr().read().rxne().bit_is_set() {
+            Ok(self.read_unchecked())
+        } else {
+            Err(nb::Error::WouldBlock)
+        }
+    }
+
+    #[inline]
+    fn read_unchecked<W: FrameSize>(&mut self) -> W {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        // NOTE(read_volatile) read only 1 byte (the svd2rust API only allows
+        // reading a half-word)
+        unsafe { ptr::read_volatile(spi.dr().as_ptr() as *const W) }
+    }
+
+    #[inline]
+    fn write_unchecked<W: FrameSize>(&mut self, word: W) {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        // NOTE(write_volatile) see note above
+        let dr = spi.dr().as_ptr() as *mut W;
+        unsafe { ptr::write_volatile(dr, word) };
+    }
+
+    /// disables rx
+    #[inline]
+    fn set_tx_only(&mut self) {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        // very counter-intuitively, setting spi bidi mode on disables rx while transmitting
+        // it's made for half-duplex spi, which they called bidirectional in the manual
+        spi
+            .cr1()
+            .modify(|_, w| w.bidimode().bidirectional().bidioe().output_enabled());
+    }
+
+    /// re-enables rx if it was disabled
+    #[inline]
+    fn set_bidi(&mut self) {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        spi
+            .cr1()
+            .modify(|_, w| w.bidimode().unidirectional().bidioe().output_disabled());
+    }
+
+    fn tx_fifo_cap(&self) -> u8 {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        match spi.sr().read().ftlvl().bits() {
+            0 => 4,
+            1 => 3,
+            2 => 2,
+            _ => 0,
+        }
+    }
+
+    fn flush_inner(&mut self) -> Result<(), Error> {
+        let spi = unsafe { Self::PTR.as_ref_unchecked() };
+        // stop receiving data
+        self.set_tx_only();
+        spi.cr2().modify(|_, w| w.frxth().set_bit());
+        // drain rx fifo
+        while match self.nb_read::<u8>() {
+            Ok(_) => true,
+            Err(nb::Error::WouldBlock) => false,
+            Err(nb::Error::Other(e)) => return Err(e),
+        } {
+            core::hint::spin_loop()
+        }
+        // wait for idle
+        while spi.sr().read().bsy().bit() {
+            core::hint::spin_loop()
+        }
+        Ok(())
+    }
+}
+
+impl<I> InstanceExt for I where I: Instance {}
+
 pub trait AsyncInstanceBasic: Instance {
     fn waker() -> &'static AtomicWaker;
+}
+
+pub struct SpiStateAsync {
+    /// locked by lower priority task
+    lp_locked: AtomicBool,
+    state: UnsafeCell<SpiStates>
+}
+
+enum SpiStates {
+    Idle {
+        result: Option<Result<(), Error>>,
+    },
+    Write {
+        grouped: *const [u16],
+        odd: Option<u8>,
+    },
+}
+
+impl SpiStateAsync {
+    fn new() -> Self {
+        Self { 
+            lp_locked: AtomicBool::new(true),
+            state: UnsafeCell::new(SpiStates::Idle { result: None })
+        }
+    }
+}
+
+// it really isn't
+// TODO: better locking abstraction
+unsafe impl Sync for SpiStateAsync {}
+
+pub trait AsyncInstanceFast: AsyncInstanceBasic + crate::Steal {
+    fn take_state() -> Option<&'static mut SpiStateAsync>;
 }
 
 unsafe impl<SPI: Instance, PINS> TargetAddress<MemoryToPeripheral> for Spi<SPI, PINS> {
@@ -147,12 +331,29 @@ macro_rules! spi {
                 return &WAKER
             }
         }
+
+        impl AsyncInstanceFast for $SPIX {
+            fn take_state() -> Option<&'static mut SpiStateAsync> {
+                cortex_m::singleton!(: SpiStateAsync = SpiStateAsync::new())
+            }
+        }
     }
 }
 
 impl<SPI: AsyncInstanceBasic, PINS> Spi<SPI, PINS> {
     pub fn into_async_basic(self) -> (SpiAsyncBasic<SPI, PINS>, SpiIrqBasic<SPI>) {
         (SpiAsyncBasic { inner: self }, SpiIrqBasic { _spi: PhantomData })
+    }
+}
+
+impl<SPI: AsyncInstanceFast, PINS> Spi<SPI, PINS> {
+    /// Returns None if called more than once
+    pub fn into_async_fast(self) -> Option<(SpiAsyncFast<SPI, PINS>, SpiIrqFast<SPI>)> {
+        let state = &*SPI::take_state()?;
+        Some((
+            SpiAsyncFast { inner: self, state },
+            SpiIrqFast { spi: unsafe { SPI::steal() }, state }
+        ))
     }
 }
 
@@ -173,7 +374,7 @@ impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::SpiBus for SpiAsync
         todo!()
     }
     async fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-        self.inner.set_tx_only();
+        self.inner.spi.set_tx_only();
 
         if words.len() > 1 {
             let mut write_iter = words.chunks_exact(2).map(|two|
@@ -183,42 +384,44 @@ impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::SpiBus for SpiAsync
                 u16::from_le_bytes(unsafe { *two.as_ptr().cast() }));
 
             let res = poll_fn(|cx: &mut core::task::Context| {
-                if let Err(e) = self.inner.err_check() {
-                    return core::task::Poll::Ready(Err(e))
+                if let Err(e) = self.inner.spi.err_check() {
+                    return Poll::Ready(Err(e))
                 };
 
-                let cap = self.inner.tx_fifo_cap() / 2;
+                let cap = self.inner.spi.tx_fifo_cap() / 2;
                 let mut over = true;
                 for next in write_iter.by_ref().take(cap as usize) {
-                    self.inner.write_unchecked(next);
+                    self.inner.spi.write_unchecked(next);
                     over = false;
                 }
 
                 if over && cap != 0 {
-                    core::task::Poll::Ready(Ok(()))
+                    Poll::Ready(Ok(()))
                 } else {
                     SPI::waker().register(cx.waker());
-                    self.inner.spi.cr2().modify(|_, w| w.txeie().set_bit());
-                    core::task::Poll::Pending
+                    self.inner.spi.cr2().modify(|_, w| w.txeie().set_bit().errie().set_bit());
+                    Poll::Pending
                 }
             }).await;
             // also clear txeie in case of error
-            self.inner.spi.cr2().modify(|_, w| w.txeie().clear_bit());
+            self.inner.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
             res?;
         }
 
         if !words.len().is_multiple_of(2) {
             let last = *words.last().unwrap();
             let res = poll_fn(|cx: &mut core::task::Context| 
-                if let Err(nb::Error::Other(e)) = self.inner.nb_write(last) {
-                    core::task::Poll::Ready(Err(e))
-                } else {
-                    self.inner.spi.cr2().modify(|_, w| w.txeie().set_bit());
-                    SPI::waker().register(cx.waker());
-                    core::task::Poll::Pending
+                match self.inner.spi.nb_write(last) {
+                    Ok(()) => Poll::Ready(Ok(())),
+                    Err(nb::Error::Other(e)) => Poll::Ready(Err(e)),
+                    Err(nb::Error::WouldBlock) => {
+                        self.inner.spi.cr2().modify(|_, w| w.txeie().set_bit().errie().set_bit());
+                        SPI::waker().register(cx.waker());
+                        Poll::Pending
+                    }
                 }
             ).await;
-            self.inner.spi.cr2().modify(|_, w| w.txeie().clear_bit());
+            self.inner.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
             res
         } else {
             Ok(())
@@ -231,7 +434,148 @@ impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::SpiBus for SpiAsync
         todo!()
     }
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        self.inner.set_tx_only();
+        self.inner.spi.set_tx_only();
+        // poll busy flag but yield to other tasks
+        poll_fn(|cx|
+            if self.inner.spi.sr().read().bsy().bit() {
+                cx.waker().wake_by_ref();
+                core::task::Poll::Pending
+            } else {
+                core::task::Poll::Ready(Ok(()))
+            }
+        ).await
+    }
+}
+
+impl<SPI: AsyncInstanceFast> SpiIrqFast<SPI> {
+    /// Sets state to idle and wakes the waiting task
+    ///
+    /// # Safety
+    ///
+    /// Safe as `on_irq`
+    unsafe fn set_idle(&mut self, result: Option<Result<(), Error>>) {
+        unsafe { *self.state.state.get() = SpiStates::Idle { result } }
+        self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
+        SPI::waker().wake();
+    }
+    /// Must be called after the corresponding SPI interrupt
+    ///
+    /// # Safety
+    /// Must never be preempted by the corresponding async task
+    pub unsafe fn on_irq(&mut self) {
+        if self.state.lp_locked.load(core::sync::atomic::Ordering::Acquire) {
+            // prevent further interrupts, let the async interface do its work
+            self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
+            return;
+        }
+
+        // safety: if the method contract is upheld we can't be pre-empted
+        // by the async methods, so there can be no race
+        // also applies to subsequent state writes
+        match unsafe { &*self.state.state.get() } {
+            SpiStates::Idle { .. } => {
+                // spurious wakeup, shouldn't happen
+                // prevent further interrupts until they get re-enabled by the async side
+                self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
+            }
+            SpiStates::Write { grouped, odd } => {
+                if let Err(e) = self.spi.err_check() {
+                    unsafe { *self.state.state.get() = SpiStates::Idle { result: Some(Err(e)) }}
+                    self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
+                } else {
+                    let cap = self.spi.tx_fifo_cap() as usize;
+                    if grouped.is_empty() && cap != 0 {
+                        if let Some(last) = odd {
+                            self.spi.write_unchecked(*last);
+                        }
+                        self.set_idle(Some(Ok(())));
+                    } else {
+                        // safety: count can't be greather than grouped.len
+                        let count = grouped.len().min(cap/2);
+                        let (write, left) = unsafe { 
+                            grouped.as_ref_unchecked().split_at_unchecked(count) };
+                        for w in write {
+                            self.spi.write_unchecked(*w);
+                        }
+
+                        if left.is_empty() && odd.is_none() {
+                            self.set_idle(Some(Ok(())));
+                        } else {
+                            unsafe { *self.state.state.get() = SpiStates::Write {
+                                grouped: left as *const [u16],
+                                odd: *odd
+                            }}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<SPI: AsyncInstanceFast, PINS> embedded_hal_async::spi::ErrorType for SpiAsyncFast<SPI, PINS> {
+    type Error = Error;
+}
+impl<SPI: AsyncInstanceFast, PINS> embedded_hal_async::spi::SpiBus for SpiAsyncFast<SPI, PINS> {
+    async fn read(&mut self, _words: &mut [u8]) -> Result<(), Self::Error> {
+        todo!()
+    }
+    async fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+        // shared state protocol:
+        // 1. state is idle with no result, interrupts are disabled
+        // 2. async write is called, locks and sets state to write with proper buffers
+        // 3. async write unlocks, enables interrupts
+        // 4. txne fires, on_irq takes over sending data
+        // 5. (TODO) if async write is canceled state is locked and set to idle,
+        //    on_irq can't access the invalid buffer pointers anymore
+        // 6. async write is woken in case of error and completion
+        self.inner.spi.set_tx_only();
+
+        // handle buffers not aligned to 16 bits
+        // safety: plain data
+        let (first, grouped, last) = unsafe { words.align_to::<u16>() };
+        if !first.is_empty() {
+            nb::block!(self.inner.spi.nb_write(first[0]))?;
+        }
+        let odd = last.first().copied();
+
+        self.state.lp_locked.store(true, core::sync::atomic::Ordering::SeqCst);
+        unsafe { *self.state.state.get() = SpiStates::Write { grouped, odd } }
+        self.state.lp_locked.store(false, core::sync::atomic::Ordering::Release);
+
+        let res = poll_fn(|cx: &mut core::task::Context| {
+            // acquire state writes from async context
+            self.state.lp_locked.store(true, core::sync::atomic::Ordering::SeqCst);
+            let res = match unsafe { &*self.state.state.get() } {
+                // spurious wakeup shouldn't happen but it's fine if it does
+                SpiStates::Idle { result: None } => unreachable!(),
+                SpiStates::Idle { result: Some(res) } => {
+                    let res = *res;
+                    unsafe { *self.state.state.get() = SpiStates::Idle { result: None } }
+                    Poll::Ready(res)
+                },
+                // spurious wakeup
+                SpiStates::Write { .. } => {
+                    SPI::waker().register(cx.waker());
+                    Poll::Pending
+                }
+            };
+            self.state.lp_locked.store(false, core::sync::atomic::Ordering::Release);
+            self.inner.spi.cr2().modify(|_, w| w.txeie().set_bit().errie().set_bit());
+            res
+        }).await;
+        // also clear txeie in case of error
+        self.inner.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
+        res
+    }
+    async fn transfer(&mut self, _read: &mut [u8], _write: &[u8]) -> Result<(), Self::Error> {
+        todo!()
+    }
+    async fn transfer_in_place(&mut self, _words: &mut [u8]) -> Result<(), Self::Error> {
+        todo!()
+    }
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.inner.spi.set_tx_only();
         // poll busy flag but yield to other tasks
         poll_fn(|cx|
             if self.inner.spi.sr().read().bsy().bit() {
@@ -255,121 +599,6 @@ impl<SPI: Instance, PINS> Spi<SPI, PINS> {
             spi: self.spi,
             pins: self.pins,
         }
-    }
-
-    fn err_check(&self) -> Result<(), Error> {
-        let sr = self.spi.sr().read();
-        const EMASK: u16 = 1 << 4 // crcerr
-            | 1 << 5 // modf
-            | 1 << 6; // ovr
-        if sr.bits() & EMASK == 0 {
-            Ok(())
-        } else {
-            Err(if sr.ovr().bit_is_set() {
-                Error::Overrun
-            } else if sr.modf().bit_is_set() {
-                Error::ModeFault
-            } else if sr.crcerr().bit_is_set() {
-                Error::Crc
-            } else {
-                // FRE unreachable outside I2S or SPI TI slave mode
-                unreachable!();
-            })
-        }
-    }
-
-    #[inline]
-    fn nb_read<W: FrameSize>(&mut self) -> nb::Result<W, Error> {
-        let sr = self.spi.sr().read();
-        Err(if sr.ovr().bit_is_set() {
-            nb::Error::Other(Error::Overrun)
-        } else if sr.modf().bit_is_set() {
-            nb::Error::Other(Error::ModeFault)
-        } else if sr.crcerr().bit_is_set() {
-            nb::Error::Other(Error::Crc)
-        } else if sr.rxne().bit_is_set() {
-            return Ok(self.read_unchecked());
-        } else {
-            nb::Error::WouldBlock
-        })
-    }
-    #[inline]
-    fn nb_write<W: FrameSize>(&mut self, word: W) -> nb::Result<(), Error> {
-        let sr = self.spi.sr().read();
-        Err(if sr.ovr().bit_is_set() {
-            nb::Error::Other(Error::Overrun)
-        } else if sr.modf().bit_is_set() {
-            nb::Error::Other(Error::ModeFault)
-        } else if sr.crcerr().bit_is_set() {
-            nb::Error::Other(Error::Crc)
-        } else if sr.txe().bit_is_set() {
-            self.write_unchecked(word);
-            return Ok(());
-        } else {
-            nb::Error::WouldBlock
-        })
-    }
-    #[inline]
-    fn nb_read_no_err<W: FrameSize>(&mut self) -> nb::Result<W, core::convert::Infallible> {
-        if self.spi.sr().read().rxne().bit_is_set() {
-            Ok(self.read_unchecked())
-        } else {
-            Err(nb::Error::WouldBlock)
-        }
-    }
-    #[inline]
-    fn read_unchecked<W: FrameSize>(&mut self) -> W {
-        // NOTE(read_volatile) read only 1 byte (the svd2rust API only allows
-        // reading a half-word)
-        unsafe { ptr::read_volatile(self.spi.dr().as_ptr() as *const W) }
-    }
-    #[inline]
-    fn write_unchecked<W: FrameSize>(&mut self, word: W) {
-        // NOTE(write_volatile) see note above
-        let dr = self.spi.dr().as_ptr() as *mut W;
-        unsafe { ptr::write_volatile(dr, word) };
-    }
-    /// disables rx
-    #[inline]
-    pub fn set_tx_only(&mut self) {
-        // very counter-intuitively, setting spi bidi mode on disables rx while transmitting
-        // it's made for half-duplex spi, which they called bidirectional in the manual
-        self.spi
-            .cr1()
-            .modify(|_, w| w.bidimode().bidirectional().bidioe().output_enabled());
-    }
-    /// re-enables rx if it was disabled
-    #[inline]
-    pub fn set_bidi(&mut self) {
-        self.spi
-            .cr1()
-            .modify(|_, w| w.bidimode().unidirectional().bidioe().output_disabled());
-    }
-    fn tx_fifo_cap(&self) -> u8 {
-        match self.spi.sr().read().ftlvl().bits() {
-            0 => 4,
-            1 => 3,
-            2 => 2,
-            _ => 0,
-        }
-    }
-    fn flush_inner(&mut self) -> Result<(), Error> {
-        // stop receiving data
-        self.set_tx_only();
-        self.spi.cr2().modify(|_, w| w.frxth().set_bit());
-        // drain rx fifo
-        while match self.nb_read::<u8>() {
-            Ok(_) => true,
-            Err(nb::Error::WouldBlock) => false,
-            Err(nb::Error::Other(e)) => return Err(e),
-        } {
-            core::hint::spin_loop()
-        }
-        // wait for idle
-        while self.spi.sr().read().bsy().bit() {
-            core::hint::spin_loop()
-        }
-        Ok(())
     }
 }
 
@@ -447,24 +676,24 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
         }
 
         // flush data from previous operations, otherwise we'd get unwanted data
-        self.flush_inner()?;
+        self.spi.flush_inner()?;
         // FIFO threshold to 16 bits
         self.spi.cr2().modify(|_, w| w.frxth().clear_bit());
-        self.set_bidi();
+        self.spi.set_bidi();
 
         let half_len = len / 2;
         // leftover write/read operation because bytes are not a multiple of 2
         let pair_left = len % 2;
 
         // prefill write fifo so that the clock doen't stop while fetch the read byte
-        let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, half_len);
+        let prefill = core::cmp::min(self.spi.tx_fifo_cap() as usize / 2, half_len);
         for _ in 0..prefill {
-            nb::block!(self.nb_write(0u16))?;
+            nb::block!(self.spi.nb_write(0u16))?;
         }
 
         for r in words.chunks_exact_mut(2).take(half_len - prefill) {
-            let r_two: u16 = nb::block!(self.nb_read_no_err()).unwrap();
-            nb::block!(self.nb_write(0u16))?;
+            let r_two: u16 = nb::block!(self.spi.nb_read_no_err()).unwrap();
+            nb::block!(self.spi.nb_write(0u16))?;
             // safety: chunks have exact length of 2
             unsafe {
                 *r.as_mut_ptr().cast() = r_two.to_le_bytes();
@@ -475,20 +704,20 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
         // FIFO threshold to 8 bits
         self.spi.cr2().modify(|_, w| w.frxth().set_bit());
         if pair_left == 1 {
-            nb::block!(self.nb_write(0u8))?;
-            words[odd_idx] = nb::block!(self.nb_read_no_err()).unwrap();
+            nb::block!(self.spi.nb_write(0u8))?;
+            words[odd_idx] = nb::block!(self.spi.nb_read_no_err()).unwrap();
         }
 
         for r in words[odd_idx + pair_left..].iter_mut() {
-            *r = nb::block!(self.nb_read())?;
+            *r = nb::block!(self.spi.nb_read())?;
         }
         Ok(())
     }
 
     fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-        self.set_tx_only();
+        self.spi.set_tx_only();
         for w in words {
-            nb::block!(self.nb_write(*w))?
+            nb::block!(self.spi.nb_write(*w))?
         }
         Ok(())
     }
@@ -500,26 +729,26 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
             return self.read(read);
         }
 
-        self.flush_inner()?;
-        self.set_bidi();
+        self.spi.flush_inner()?;
+        self.spi.set_bidi();
         let common_len = core::cmp::min(read.len(), write.len());
         let half_len = common_len / 2;
         let pair_left = common_len % 2;
 
         // write two bytes at once
         let mut write_iter = write.chunks_exact(2).map(|two|
-                    // safety: chunks_exact guarantees that chunks have 2 elements
-                    // second byte in send queue goes to the top of the 16-bit data register for
-                    // packing
-                    u16::from_le_bytes(unsafe { *two.as_ptr().cast() }));
+            // safety: chunks_exact guarantees that chunks have 2 elements
+            // second byte in send queue goes to the top of the 16-bit data register for
+            // packing
+            u16::from_le_bytes(unsafe { *two.as_ptr().cast() }));
 
         // FIFO threshold to 16 bits
         self.spi.cr2().modify(|_, w| w.frxth().clear_bit());
 
         // same prefill as in read, this time with actual data
-        let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, half_len);
+        let prefill = core::cmp::min(self.spi.tx_fifo_cap() as usize / 2, half_len);
         for b in write_iter.by_ref().take(prefill) {
-            nb::block!(self.nb_write(b))?;
+            nb::block!(self.spi.nb_write(b))?;
         }
 
         // write ahead of reading
@@ -528,8 +757,8 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
             .zip(write_iter)
             .take(half_len - prefill);
         for (r, w) in zipped {
-            let r_two: u16 = nb::block!(self.nb_read_no_err()).unwrap();
-            nb::block!(self.nb_write(w))?;
+            let r_two: u16 = nb::block!(self.spi.nb_read_no_err()).unwrap();
+            nb::block!(self.spi.nb_write(w))?;
             // same as above, length is checked by chunks_exact
             unsafe {
                 *r.as_mut_ptr().cast() = r_two.to_le_bytes();
@@ -542,18 +771,20 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
         if pair_left == 1 {
             let write_idx = common_len - 1;
             if prefill == 0 {
-                nb::block!(self.nb_write(write[write_idx]))?;
-                read[write_idx - 2 * prefill] = nb::block!(self.nb_read_no_err()).unwrap();
+                nb::block!(self.spi.nb_write(write[write_idx]))?;
+                read[write_idx - 2 * prefill] =
+                    nb::block!(self.spi.nb_read_no_err()).unwrap();
             } else {
                 // there's already data in the fifo, so read that before writing more
-                read[write_idx - 2 * prefill] = nb::block!(self.nb_read_no_err()).unwrap();
-                nb::block!(self.nb_write(write[write_idx]))?;
+                read[write_idx - 2 * prefill] =
+                    nb::block!(self.spi.nb_read_no_err()).unwrap();
+                nb::block!(self.spi.nb_write(write[write_idx]))?;
             }
         }
 
         // read words left in the fifo
         for r in read[common_len - 2 * prefill..common_len].iter_mut() {
-            *r = nb::block!(self.nb_read())?
+            *r = nb::block!(self.spi.nb_read())?
         }
 
         if read.len() > common_len {
@@ -568,50 +799,50 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u8> for Spi<SPI, 
             return Ok(());
         }
 
-        self.flush_inner()?;
-        self.set_bidi();
+        self.spi.flush_inner()?;
+        self.spi.set_bidi();
         self.spi.cr2().modify(|_, w| w.frxth().clear_bit());
         let half_len = len / 2;
         let pair_left = len % 2;
 
-        let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, half_len);
+        let prefill = core::cmp::min(self.spi.tx_fifo_cap() as usize / 2, half_len);
         let words_alias: &mut [[u8; 2]] = unsafe {
             let ptr = words.as_mut_ptr();
             core::slice::from_raw_parts_mut(ptr as *mut [u8; 2], half_len)
         };
 
         for b in words_alias.iter_mut().take(prefill) {
-            nb::block!(self.nb_write(u16::from_le_bytes(*b)))?;
+            nb::block!(self.spi.nb_write(u16::from_le_bytes(*b)))?;
         }
 
         // data is in fifo isn't zero as long as words.len() > 1 so read-then-write is fine
         for i in 0..words_alias.len() - prefill {
-            let read: u16 = nb::block!(self.nb_read_no_err()).unwrap();
+            let read: u16 = nb::block!(self.spi.nb_read_no_err()).unwrap();
             words_alias[i] = read.to_le_bytes();
             let write = u16::from_le_bytes(words_alias[i + prefill]);
-            nb::block!(self.nb_write(write))?;
+            nb::block!(self.spi.nb_write(write))?;
         }
         self.spi.cr2().modify(|_, w| w.frxth().set_bit());
 
         if pair_left == 1 {
             let read_idx = len - 2 * prefill - 1;
             if prefill == 0 {
-                nb::block!(self.nb_write(*words.last().unwrap()))?;
-                words[read_idx] = nb::block!(self.nb_read_no_err()).unwrap();
+                nb::block!(self.spi.nb_write(*words.last().unwrap()))?;
+                words[read_idx] = nb::block!(self.spi.nb_read_no_err()).unwrap();
             } else {
-                words[read_idx] = nb::block!(self.nb_read_no_err()).unwrap();
-                nb::block!(self.nb_write(*words.last().unwrap()))?;
+                words[read_idx] = nb::block!(self.spi.nb_read_no_err()).unwrap();
+                nb::block!(self.spi.nb_write(*words.last().unwrap()))?;
             }
         }
 
         // read words left in the fifo
         for r in words.iter_mut().skip(len - 2 * prefill) {
-            *r = nb::block!(self.nb_read())?;
+            *r = nb::block!(self.spi.nb_read())?;
         }
         Ok(())
     }
     fn flush(&mut self) -> Result<(), Self::Error> {
-        self.flush_inner()
+        self.spi.flush_inner()
     }
 }
 impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u16> for Spi<SPI, PINS> {
@@ -621,29 +852,29 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u16> for Spi<SPI,
             return Ok(());
         }
         // flush data from previous operations, otherwise we'd get unwanted data
-        self.flush_inner()?;
+        self.spi.flush_inner()?;
         // FIFO threshold to 16 bits
         self.spi.cr2().modify(|_, w| w.frxth().clear_bit());
-        self.set_bidi();
+        self.spi.set_bidi();
         // prefill write fifo so that the clock doen't stop while fetch the read byte
-        let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, len);
+        let prefill = core::cmp::min(self.spi.tx_fifo_cap() as usize / 2, len);
         for _ in 0..prefill {
-            nb::block!(self.nb_write(0u16))?;
+            nb::block!(self.spi.nb_write(0u16))?;
         }
 
         for w in &mut words[..len - prefill] {
-            *w = nb::block!(self.nb_read_no_err()).unwrap();
-            nb::block!(self.nb_write(0u16))?;
+            *w = nb::block!(self.spi.nb_read_no_err()).unwrap();
+            nb::block!(self.spi.nb_write(0u16))?;
         }
         for w in &mut words[len - prefill..] {
-            *w = nb::block!(self.nb_read())?;
+            *w = nb::block!(self.spi.nb_read())?;
         }
         Ok(())
     }
     fn write(&mut self, words: &[u16]) -> Result<(), Self::Error> {
-        self.set_tx_only();
+        self.spi.set_tx_only();
         for w in words {
-            nb::block!(self.nb_write(*w))?
+            nb::block!(self.spi.nb_write(*w))?
         }
         Ok(())
     }
@@ -654,27 +885,27 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u16> for Spi<SPI,
             return self.read(read);
         }
 
-        self.flush_inner()?;
+        self.spi.flush_inner()?;
         // FIFO threshold to 16 bits
         self.spi.cr2().modify(|_, w| w.frxth().clear_bit());
-        self.set_bidi();
+        self.spi.set_bidi();
         let common_len = core::cmp::min(read.len(), write.len());
         // same prefill as in read, this time with actual data
-        let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, common_len);
+        let prefill = core::cmp::min(self.spi.tx_fifo_cap() as usize / 2, common_len);
 
         let mut write_iter = write.iter();
         for w in write_iter.by_ref().take(prefill) {
-            nb::block!(self.nb_write(*w))?;
+            nb::block!(self.spi.nb_write(*w))?;
         }
 
         let zipped = read.iter_mut().zip(write_iter).take(common_len - prefill);
         for (r, w) in zipped {
-            *r = nb::block!(self.nb_read_no_err()).unwrap();
-            nb::block!(self.nb_write(*w))?;
+            *r = nb::block!(self.spi.nb_read_no_err()).unwrap();
+            nb::block!(self.spi.nb_write(*w))?;
         }
 
         for r in &mut read[common_len - prefill..common_len] {
-            *r = nb::block!(self.nb_read())?
+            *r = nb::block!(self.spi.nb_read())?
         }
 
         if read.len() > common_len {
@@ -689,28 +920,28 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal::spi::SpiBus<u16> for Spi<SPI,
             return Ok(());
         }
 
-        self.flush_inner()?;
-        self.set_bidi();
+        self.spi.flush_inner()?;
+        self.spi.set_bidi();
         self.spi.cr2().modify(|_, w| w.frxth().clear_bit());
-        let prefill = core::cmp::min(self.tx_fifo_cap() as usize / 2, len);
+        let prefill = core::cmp::min(self.spi.tx_fifo_cap() as usize / 2, len);
 
         for w in &words[..prefill] {
-            nb::block!(self.nb_write(*w))?;
+            nb::block!(self.spi.nb_write(*w))?;
         }
 
         for read_idx in 0..len - prefill {
             let write_idx = read_idx + prefill;
-            words[read_idx] = nb::block!(self.nb_read_no_err()).unwrap();
-            nb::block!(self.nb_write(words[write_idx]))?;
+            words[read_idx] = nb::block!(self.spi.nb_read_no_err()).unwrap();
+            nb::block!(self.spi.nb_write(words[write_idx]))?;
         }
 
         for r in &mut words[len - prefill..] {
-            *r = nb::block!(self.nb_read())?;
+            *r = nb::block!(self.spi.nb_read())?;
         }
         Ok(())
     }
     fn flush(&mut self) -> Result<(), Self::Error> {
-        self.flush_inner()
+        self.spi.flush_inner()
     }
 }
 
@@ -718,11 +949,11 @@ impl<SPI: Instance, PINS: Pins<SPI>> embedded_hal_old::spi::FullDuplex<u8> for S
     type Error = Error;
 
     fn read(&mut self) -> nb::Result<u8, Error> {
-        self.nb_read()
+        self.spi.nb_read()
     }
 
     fn send(&mut self, byte: u8) -> nb::Result<(), Error> {
-        self.nb_write(byte)
+        self.spi.nb_write(byte)
     }
 }
 
