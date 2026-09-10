@@ -376,12 +376,16 @@ impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::SpiBus for SpiAsync
     async fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
         self.inner.spi.set_tx_only();
 
-        if words.len() > 1 {
-            let mut write_iter = words.chunks_exact(2).map(|two|
-                // safety: chunks_exact guarantees that chunks have 2 elements
-                // second byte in send queue goes to the top of the 16-bit data register for
-                // packing
-                u16::from_le_bytes(unsafe { *two.as_ptr().cast() }));
+        // safety: plain data
+        let (first, grouped, last) = unsafe { words.align_to::<u16>() };
+        // optimistically assume there's space in the fifo and block on the write
+        if !first.is_empty() {
+            nb::block!(self.inner.spi.nb_write(first[0]))?;
+        }
+        let odd = last.first().copied();
+
+        if grouped.len() > 1 {
+            let mut write_iter = grouped.iter();
 
             let res = poll_fn(|cx: &mut core::task::Context| {
                 if let Err(e) = self.inner.spi.err_check() {
@@ -391,7 +395,7 @@ impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::SpiBus for SpiAsync
                 let cap = self.inner.spi.tx_fifo_cap() / 2;
                 let mut over = true;
                 for next in write_iter.by_ref().take(cap as usize) {
-                    self.inner.spi.write_unchecked(next);
+                    self.inner.spi.write_unchecked(*next);
                     over = false;
                 }
 
@@ -408,8 +412,7 @@ impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::SpiBus for SpiAsync
             res?;
         }
 
-        if !words.len().is_multiple_of(2) {
-            let last = *words.last().unwrap();
+        if let Some(last) = odd {
             let res = poll_fn(|cx: &mut core::task::Context| 
                 match self.inner.spi.nb_write(last) {
                     Ok(()) => Poll::Ready(Ok(())),
