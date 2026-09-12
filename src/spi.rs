@@ -546,11 +546,24 @@ impl<SPI: AsyncInstanceFast, PINS> embedded_hal_async::spi::SpiBus for SpiAsyncF
         unsafe { *self.state.state.get() = SpiStates::Write { grouped, odd } }
         self.state.lp_locked.store(false, core::sync::atomic::Ordering::Release);
 
-        let res = poll_fn(|cx: &mut core::task::Context| {
+        /// Cancel-safe future for handling async write completion
+        ///
+        /// Its drop impl clears the shared state, preventing the IRQ side from accessing
+        /// potentially dropped buffers
+        #[must_use = "futures do nothing unless you `.await` or poll them"]
+        struct CancelableWriteFuture<'a, SPI: Instance> { 
+            state: &'a SpiStateAsync,
+            spi: &'a mut SPI
+        }
+
+        impl<'a, SPI: AsyncInstanceFast> core::future::Future for CancelableWriteFuture<'a, SPI> {
+            type Output = Result<(), Error>;
+            fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context)
+                -> Poll<Self::Output> {
             // acquire state writes from async context
             self.state.lp_locked.store(true, core::sync::atomic::Ordering::SeqCst);
             let res = match unsafe { &*self.state.state.get() } {
-                // spurious wakeup shouldn't happen but it's fine if it does
+                // spurious wakeup that i'm pretty sure can't happen
                 SpiStates::Idle { result: None } => unreachable!(),
                 SpiStates::Idle { result: Some(res) } => {
                     let res = *res;
@@ -560,13 +573,30 @@ impl<SPI: AsyncInstanceFast, PINS> embedded_hal_async::spi::SpiBus for SpiAsyncF
                 // spurious wakeup
                 SpiStates::Write { .. } => {
                     SPI::waker().register(cx.waker());
+                    self.spi.cr2().modify(|_, w| w.txeie().set_bit().errie().set_bit());
                     Poll::Pending
                 }
             };
             self.state.lp_locked.store(false, core::sync::atomic::Ordering::Release);
-            self.inner.spi.cr2().modify(|_, w| w.txeie().set_bit().errie().set_bit());
             res
-        }).await;
+            }
+        }
+
+        impl<SPI: Instance> Drop for CancelableWriteFuture<'_, SPI> {
+            fn drop(&mut self) {
+                // disable subsequent interrupts, lock state,
+                // clear pending operation so that the state doesn't hold dangling pointers
+                self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
+                self.state.lp_locked.store(true, core::sync::atomic::Ordering::SeqCst);
+                unsafe { *self.state.state.get() = SpiStates::Idle { result: None } };
+                self.state.lp_locked.store(false, core::sync::atomic::Ordering::Release);
+            }
+        }
+
+        let res = CancelableWriteFuture {
+            state: self.state,
+            spi: &mut self.inner.spi
+        }.await;
         // also clear txeie in case of error
         self.inner.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
         res
