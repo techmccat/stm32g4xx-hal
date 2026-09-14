@@ -83,12 +83,12 @@ pub struct SpiIrqBasic<SPI> {
 
 pub struct SpiAsyncFast<SPI, PINS> {
     inner: Spi<SPI, PINS>,
-    state: &'static SpiStateAsync,
+    state: NPLockLower<'static, SpiStates>,
 }
 
 pub struct SpiIrqFast<SPI> {
     spi: SPI,
-    state: &'static SpiStateAsync,
+    state: NPLockHigher<'static, SpiStates>,
 }
 
 pub trait SpiExt<SPI>: Sized {
@@ -255,13 +255,69 @@ pub trait AsyncInstanceBasic: Instance {
     fn waker() -> &'static AtomicWaker;
 }
 
-pub struct SpiStateAsync {
-    /// locked by lower priority task
+type SpiStateAsync = NoPreemptLock<SpiStates>;
+
+/// Lock for resource shared by two tasks,
+/// only one of which can preempt the other
+pub struct NoPreemptLock<T> {
     lp_locked: AtomicBool,
-    state: UnsafeCell<SpiStates>
+    inner: UnsafeCell<T>
 }
 
-enum SpiStates {
+// should be fine as long as the locking invariants are upheld by the caller
+unsafe impl<T> Sync for NoPreemptLock<T> {}
+
+impl<T> NoPreemptLock<T> {
+    fn new(inner: T) -> Self {
+        NoPreemptLock {
+            lp_locked: AtomicBool::new(true),
+            inner: UnsafeCell::new(inner)
+        }
+    }
+
+    fn split<'a>(&'a mut self) -> (NPLockLower<'a, T>, NPLockHigher<'a, T>) {
+        let shared = &*self;
+        (NPLockLower(shared), NPLockHigher(shared))
+    }
+}
+
+struct NPLockHigher<'a, T>(&'a NoPreemptLock<T>);
+struct NPLockLower<'a, T>(&'a NoPreemptLock<T>);
+
+impl<'a, T> NPLockHigher<'a, T> {
+    /// Runs the provided closure if the lock isn't in use
+    ///
+    /// # Safety
+    /// The closure must not be preempted by the task holding
+    /// the matching NPLockLower.
+    unsafe fn run_if_unlocked<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        if self.0.lp_locked.load(core::sync::atomic::Ordering::Acquire) {
+            None
+        } else {
+            // safety: there will be no races as long as the contract is upheld
+            // since there's only one core and this code can't be interrupted
+            // by the holder of the other lock interface
+            let inner = unsafe { &mut *self.0.inner.get() };
+            Some(f(inner))
+        }
+    }
+}
+
+impl<'a, T> NPLockLower<'a, T> {
+    /// Runs the provided closure with the lock asserted
+    fn lock<R>(&mut self, f: impl FnOnce(&mut T) -> R) -> R {
+        // can't acquire with a store, so seqcst it is
+        self.0.lp_locked.store(true, core::sync::atomic::Ordering::SeqCst);
+        // safety: lock is locked, higher priority half will not access the shared mut
+        // once lp_locked is asserted
+        let inner = unsafe { &mut *self.0.inner.get() };
+        let res = f(inner);
+        self.0.lp_locked.store(false, core::sync::atomic::Ordering::Release);
+        res
+    }
+}
+
+pub enum SpiStates {
     Idle {
         result: Option<Result<(), Error>>,
     },
@@ -270,19 +326,6 @@ enum SpiStates {
         odd: Option<u8>,
     },
 }
-
-impl SpiStateAsync {
-    fn new() -> Self {
-        Self { 
-            lp_locked: AtomicBool::new(true),
-            state: UnsafeCell::new(SpiStates::Idle { result: None })
-        }
-    }
-}
-
-// it really isn't
-// TODO: better locking abstraction
-unsafe impl Sync for SpiStateAsync {}
 
 pub trait AsyncInstanceFast: AsyncInstanceBasic + crate::Steal {
     fn take_state() -> Option<&'static mut SpiStateAsync>;
@@ -334,7 +377,8 @@ macro_rules! spi {
 
         impl AsyncInstanceFast for $SPIX {
             fn take_state() -> Option<&'static mut SpiStateAsync> {
-                cortex_m::singleton!(: SpiStateAsync = SpiStateAsync::new())
+                cortex_m::singleton!(: SpiStateAsync = 
+                    SpiStateAsync::new(SpiStates::Idle { result: None }))
             }
         }
     }
@@ -349,10 +393,10 @@ impl<SPI: AsyncInstanceBasic, PINS> Spi<SPI, PINS> {
 impl<SPI: AsyncInstanceFast, PINS> Spi<SPI, PINS> {
     /// Returns None if called more than once
     pub fn into_async_fast(self) -> Option<(SpiAsyncFast<SPI, PINS>, SpiIrqFast<SPI>)> {
-        let state = &*SPI::take_state()?;
+        let (astate, istate) = SPI::take_state()?.split();
         Some((
-            SpiAsyncFast { inner: self, state },
-            SpiIrqFast { spi: unsafe { SPI::steal() }, state }
+            SpiAsyncFast { inner: self, state: astate },
+            SpiIrqFast { spi: unsafe { SPI::steal() }, state: istate }
         ))
     }
 }
@@ -451,67 +495,66 @@ impl<SPI: AsyncInstanceBasic, PINS> embedded_hal_async::spi::SpiBus for SpiAsync
 }
 
 impl<SPI: AsyncInstanceFast> SpiIrqFast<SPI> {
-    /// Sets state to idle and wakes the waiting task
-    ///
-    /// # Safety
-    ///
-    /// Safe as `on_irq`
-    unsafe fn set_idle(&mut self, result: Option<Result<(), Error>>) {
-        unsafe { *self.state.state.get() = SpiStates::Idle { result } }
-        self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
-        SPI::waker().wake();
+    fn on_irq_locked(spi: &mut SPI, state: &mut SpiStates) {
+        let next = match state {
+            SpiStates::Idle { .. } => {
+                // spurious wakeup, shouldn't happen
+                // prevent further interrupts until they get re-enabled by the async side
+                spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
+                None
+            }
+            SpiStates::Write { grouped, odd } => {
+                if let Err(e) = spi.err_check() {
+                    Some(SpiStates::Idle { result: Some(Err(e)) })
+                } else {
+                    let cap = spi.tx_fifo_cap() as usize;
+                    if grouped.is_empty() && cap != 0 {
+                        if let Some(last) = odd {
+                            spi.write_unchecked(*last);
+                        }
+                        Some(SpiStates::Idle { result: Some(Ok(())) })
+                    } else {
+                        // safety: count can't be greather than grouped.len
+                        let count = grouped.len().min(cap/2);
+                        let (write, left) = unsafe { 
+                            grouped.as_ref_unchecked().split_at_unchecked(count) 
+                        };
+                        for w in write {
+                            spi.write_unchecked(*w);
+                        }
+
+                        if left.is_empty() && odd.is_none() {
+                            Some(SpiStates::Idle { result: Some(Ok(())) })
+                        } else {
+                            Some(SpiStates::Write {
+                                grouped: left as *const [u16],
+                                odd: *odd
+                            })
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Some(next) = next {
+            if matches!(next, SpiStates::Idle { .. }) {
+                spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
+                SPI::waker().wake();
+            }
+            *state = next
+        }
     }
+
     /// Must be called after the corresponding SPI interrupt
     ///
     /// # Safety
     /// Must never be preempted by the corresponding async task
     pub unsafe fn on_irq(&mut self) {
-        if self.state.lp_locked.load(core::sync::atomic::Ordering::Acquire) {
+        if self.state
+            .run_if_unlocked(|state| Self::on_irq_locked(&mut self.spi, state))
+            .is_none() {
             // prevent further interrupts, let the async interface do its work
             self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
-            return;
-        }
-
-        // safety: if the method contract is upheld we can't be pre-empted
-        // by the async methods, so there can be no race
-        // also applies to subsequent state writes
-        match unsafe { &*self.state.state.get() } {
-            SpiStates::Idle { .. } => {
-                // spurious wakeup, shouldn't happen
-                // prevent further interrupts until they get re-enabled by the async side
-                self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
-            }
-            SpiStates::Write { grouped, odd } => {
-                if let Err(e) = self.spi.err_check() {
-                    unsafe { *self.state.state.get() = SpiStates::Idle { result: Some(Err(e)) }}
-                    self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
-                } else {
-                    let cap = self.spi.tx_fifo_cap() as usize;
-                    if grouped.is_empty() && cap != 0 {
-                        if let Some(last) = odd {
-                            self.spi.write_unchecked(*last);
-                        }
-                        self.set_idle(Some(Ok(())));
-                    } else {
-                        // safety: count can't be greather than grouped.len
-                        let count = grouped.len().min(cap/2);
-                        let (write, left) = unsafe { 
-                            grouped.as_ref_unchecked().split_at_unchecked(count) };
-                        for w in write {
-                            self.spi.write_unchecked(*w);
-                        }
-
-                        if left.is_empty() && odd.is_none() {
-                            self.set_idle(Some(Ok(())));
-                        } else {
-                            unsafe { *self.state.state.get() = SpiStates::Write {
-                                grouped: left as *const [u16],
-                                odd: *odd
-                            }}
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -542,9 +585,7 @@ impl<SPI: AsyncInstanceFast, PINS> embedded_hal_async::spi::SpiBus for SpiAsyncF
         }
         let odd = last.first().copied();
 
-        self.state.lp_locked.store(true, core::sync::atomic::Ordering::SeqCst);
-        unsafe { *self.state.state.get() = SpiStates::Write { grouped, odd } }
-        self.state.lp_locked.store(false, core::sync::atomic::Ordering::Release);
+        self.state.lock(|state| *state = SpiStates::Write { grouped, odd });
 
         /// Cancel-safe future for handling async write completion
         ///
@@ -552,33 +593,39 @@ impl<SPI: AsyncInstanceFast, PINS> embedded_hal_async::spi::SpiBus for SpiAsyncF
         /// potentially dropped buffers
         #[must_use = "futures do nothing unless you `.await` or poll them"]
         struct CancelableWriteFuture<'a, SPI: Instance> { 
-            state: &'a SpiStateAsync,
+            state: &'a mut NPLockLower<'static, SpiStates>,
             spi: &'a mut SPI
         }
 
         impl<'a, SPI: AsyncInstanceFast> core::future::Future for CancelableWriteFuture<'a, SPI> {
             type Output = Result<(), Error>;
-            fn poll(self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context)
+            fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context)
                 -> Poll<Self::Output> {
-            // acquire state writes from async context
-            self.state.lp_locked.store(true, core::sync::atomic::Ordering::SeqCst);
-            let res = match unsafe { &*self.state.state.get() } {
-                // spurious wakeup that i'm pretty sure can't happen
-                SpiStates::Idle { result: None } => unreachable!(),
-                SpiStates::Idle { result: Some(res) } => {
-                    let res = *res;
-                    unsafe { *self.state.state.get() = SpiStates::Idle { result: None } }
-                    Poll::Ready(res)
-                },
-                // spurious wakeup
-                SpiStates::Write { .. } => {
-                    SPI::waker().register(cx.waker());
-                    self.spi.cr2().modify(|_, w| w.txeie().set_bit().errie().set_bit());
-                    Poll::Pending
+                let poll_locked = |state: &mut _| {
+                    let (poll, next) = match state {
+                        // spurious wakeup that i'm pretty sure can't happen
+                        SpiStates::Idle { result: None } => unreachable!(),
+                        SpiStates::Idle { result: Some(res) } => {
+                            (Poll::Ready(*res), Some(SpiStates::Idle { result: None }))
+                        },
+                        // spurious wakeup
+                        SpiStates::Write { .. } => {
+                            SPI::waker().register(cx.waker());
+                            (Poll::Pending, None)
+                        }
+                    };
+                    if let Some(next) = next {
+                        *state = next
+                    }
+                    poll
+                };
+                // destructure to avoid multiple mutable borrows on self
+                let CancelableWriteFuture{ state, spi } = &mut *self;
+                let res = state.lock(poll_locked);
+                if res.is_pending() {
+                    spi.cr2().modify(|_, w| w.txeie().set_bit().errie().set_bit());
                 }
-            };
-            self.state.lp_locked.store(false, core::sync::atomic::Ordering::Release);
-            res
+                res
             }
         }
 
@@ -587,14 +634,12 @@ impl<SPI: AsyncInstanceFast, PINS> embedded_hal_async::spi::SpiBus for SpiAsyncF
                 // disable subsequent interrupts, lock state,
                 // clear pending operation so that the state doesn't hold dangling pointers
                 self.spi.cr2().modify(|_, w| w.txeie().clear_bit().errie().clear_bit());
-                self.state.lp_locked.store(true, core::sync::atomic::Ordering::SeqCst);
-                unsafe { *self.state.state.get() = SpiStates::Idle { result: None } };
-                self.state.lp_locked.store(false, core::sync::atomic::Ordering::Release);
+                self.state.lock(|state| *state = SpiStates::Idle { result: None });
             }
         }
 
         let res = CancelableWriteFuture {
-            state: self.state,
+            state: &mut self.state,
             spi: &mut self.inner.spi
         }.await;
         // also clear txeie in case of error
