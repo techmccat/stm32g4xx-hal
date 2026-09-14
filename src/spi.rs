@@ -75,14 +75,14 @@ pub struct Spi<SPI, PINS> {
 
 #[derive(Debug)]
 pub struct SpiAsyncBasic<SPI, PINS> {
-    inner: Spi<SPI, PINS>
+    pub inner: Spi<SPI, PINS>
 }
 pub struct SpiIrqBasic<SPI> {
     _spi: PhantomData<SPI>
 }
 
 pub struct SpiAsyncFast<SPI, PINS> {
-    inner: Spi<SPI, PINS>,
+    pub inner: Spi<SPI, PINS>,
     state: NPLockLower<'static, SpiStates>,
 }
 
